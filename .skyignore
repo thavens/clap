@@ -1,0 +1,7 @@
+# SkyPilot workdir sync exclusions. This file exists because .gitignore's `dataset/*`
+# pattern (meant for local data dirs) would otherwise exclude the tracked
+# verl/utils/dataset/ package from the sync.
+.git
+.venv
+**/__pycache__
+*.pyc

@@ -65,6 +65,15 @@ STACKED_PARAMS = [
     ".wq_b.weight",
     ".wk.weight",
     ".weights_proj.weight",
+    # Qwen3.5 gated-delta-network projections. vLLM wraps every supported
+    # linear layer when LoRA is enabled, including these layers even when the
+    # training adapter only targets attention/MLP projections.
+    ".conv1d.weight",
+    ".in_proj_qkv.weight",
+    ".in_proj_z.weight",
+    ".in_proj_b.weight",
+    ".in_proj_a.weight",
+    ".out_proj.weight",
 ]
 
 
@@ -120,8 +129,12 @@ def convert_megatron_to_hf_target_modules(megatron_modules: list[str]) -> list[s
     """
     hf_target_modules = []
     for module in megatron_modules:
-        if module in MEGATRON_TO_HF_MODULES:
-            hf_target_modules.extend(MEGATRON_TO_HF_MODULES[module])
+        # Megatron-Bridge accepts wildcard-qualified targets (for example,
+        # ``*language_model.*.linear_qkv``). vLLM only needs the corresponding
+        # HF leaf-module names when it constructs the LoRA manager.
+        leaf_module = module.rsplit(".", maxsplit=1)[-1]
+        if leaf_module in MEGATRON_TO_HF_MODULES:
+            hf_target_modules.extend(MEGATRON_TO_HF_MODULES[leaf_module])
         else:
             hf_target_modules.append(module)
     # Remove duplicates while preserving order

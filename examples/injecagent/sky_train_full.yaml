@@ -1,0 +1,90 @@
+# Full InjecAgent CLAP training run on two RunPod H100s.
+#
+# Launch with:
+#   sky launch -c clap-injecagent-gpt5nano-full examples/injecagent/sky_train_full.yaml \
+#     --secret OPENAI_API_KEY --secret WANDB_API_KEY --secret HF_TOKEN
+
+resources:
+  infra: runpod
+  accelerators: H100-SXM:2
+
+num_nodes: 1
+
+workdir: .
+
+secrets:
+  OPENAI_API_KEY: ""
+  WANDB_API_KEY: ""
+  HF_TOKEN: ""
+
+setup: |
+  set -euo pipefail
+
+  export DEBIAN_FRONTEND=noninteractive
+  SUDO=""
+  [ "$(id -u)" -eq 0 ] || SUDO=sudo
+  export CUDA_HOME=/usr/local/cuda-13.0
+  export PATH="$CUDA_HOME/bin:$HOME/.local/bin:$PATH"
+
+  if ! command -v nvcc >/dev/null 2>&1; then
+    if ! ls /etc/apt/sources.list.d 2>/dev/null | grep -qi cuda; then
+      . /etc/os-release
+      wget -qO /tmp/cuda-keyring.deb \
+        "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${VERSION_ID//./}/x86_64/cuda-keyring_1.1-1_all.deb"
+      $SUDO dpkg -i /tmp/cuda-keyring.deb
+    fi
+    $SUDO apt-get update -y
+    $SUDO apt-get install -y \
+      build-essential cuda-toolkit-13-0 cudnn9-cuda-13 libcudnn9-dev-cuda-13 \
+      libnccl2 libnccl-dev git wget curl
+  fi
+  nvcc --version
+  nvidia-smi
+
+  command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh
+  cd ~/sky_workdir
+  [ -d .venv ] || uv venv --python 3.12 --seed
+  source .venv/bin/activate
+
+  uv pip install "vllm==0.25.1" "transformers==5.14.1" "openai>=2.46" wandb "TransferQueue==0.1.8"
+  uv pip install -e . --no-build-isolation
+  uv pip install ninja pybind11 einops cmake flash-linear-attention
+
+  if ! python -c "import transformer_engine.pytorch" 2>/dev/null; then
+    uv pip install --no-build-isolation "transformer-engine[pytorch]==2.17.0"
+  fi
+  if ! python -c "import megatron.core" 2>/dev/null; then
+    uv pip install --no-deps \
+      "git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.18.0"
+  fi
+  uv pip install -U "git+https://github.com/ISEEKYAN/mbridge.git@main"
+  uv pip install "nvidia-modelopt[torch]>=0.37.0"
+  uv pip install --no-deps "megatron-bridge==0.5.0"
+  # Restore the versions used for Qwen3.5 after optional packages resolve their dependencies.
+  uv pip install "transformers==5.14.1" "openai>=2.46"
+  python examples/injecagent/patch_megatron_bridge.py
+
+  python -c "import megatron.core, transformer_engine.pytorch, transformers, vllm; print('vllm', vllm.__version__, '| transformers', transformers.__version__, '| Megatron and TE ok')"
+  hf download Qwen/Qwen3.5-4B-Base --local-dir "$HOME/models/Qwen3.5-4B-Base"
+  python examples/data_preprocess/injecagent.py --output-dir "$HOME/data/injecagent"
+
+run: |
+  set -euo pipefail
+  export PATH="$HOME/.local/bin:$PATH"
+  export CUDA_HOME=/usr/local/cuda-13.0
+  export PATH="$CUDA_HOME/bin:$PATH"
+  export CUDA_VISIBLE_DEVICES=0,1
+  export MAX_JOBS=4
+  export NVCC_THREADS=2
+  export TORCHINDUCTOR_COMPILE_THREADS=8
+  export OMP_NUM_THREADS=16
+  export VLLM_USE_DEEP_GEMM=0
+  export RAY_memory_usage_threshold=0.98
+  unset RAY_ADDRESS || true
+
+  cd ~/sky_workdir
+  source .venv/bin/activate
+  MODEL_PATH="$HOME/models/Qwen3.5-4B-Base" \
+    examples/injecagent/run_qwen3_5_4b_megatron.sh \
+      trainer.experiment_name=injecagent_gpt5nano_clap_qwen35_4b_full \
+      2>&1 | tee "$HOME/injecagent_train.log"
