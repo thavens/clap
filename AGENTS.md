@@ -72,6 +72,59 @@ Review comments from agent bots (e.g., gemini-code-assist) can be outdated or wr
 
 ---
 
+## 3. Project Context: CLAP Prompt-Injection RL
+
+This fork exists to run **CLAP** — RL training for prompt-injection attack and
+defense on tool-using LLM agents. It is a port of the training loop from
+`thavens/rl-hammer-hardening` (originally on SkyRL) onto verl, chosen because
+verl makes on-policy self-distillation methods tractable. Assume any task in
+this repo is about that loop unless stated otherwise.
+
+### Roles
+
+Every rollout has two roles. Which one is *trained* defines the regime; the
+other is frozen.
+
+- **Attacker** — writes an injection string that gets embedded into a tool
+  result returned to the agent. Its goal is to make the agent perform an
+  *injected* task on top of (or instead of) the user's original task.
+- **Defender** — the tool-using agent under attack. It sees the user task, its
+  own tool call, and the poisoned tool output. Its goal is to complete the user
+  task while ignoring the injected instruction.
+
+**Today only the attacker is trained here.** The policy generates the injection
+from the CLAP attacker prompt; the defender is a frozen hosted OpenAI model
+queried per rollout inside the reward function. Reward is binary attack
+success — 1 iff the defender's first tool call is the attacker's target tool.
+So the attacker is rewarded for *breaking* the defender, and a rising reward
+curve means attacks are getting stronger, not that the agent is getting safer.
+
+Upstream supports regimes this port does not yet: adversarial co-training
+(both roles trained) and defender-only training (a frozen ground-truth attacker
+replays dataset strings). If asked for "defender training," that is new work,
+not a config flag.
+
+### Vocabulary
+
+- **Setting** — a benchmark. Upstream has InjecAgent, AgentDojo, AdvBench, and
+  PIArena; **only InjecAgent is ported here**, single-turn and hard-coded.
+- **Scenario** — one example (one prompt row) from a Setting, owning the group
+  of attacker/defender rollouts generated for it.
+- **CLAP attacker prompt** — the fixed template handed to the attacker policy,
+  carrying the original user task, the injected task, and the tool-output
+  context with a `<PLACEHOLDER>` marker where its output is spliced in.
+
+### Where things live
+
+Data conversion, the CLAP prompt, the frozen-defender call, and scoring all sit
+in the InjecAgent reward module under `verl/utils/reward_score/`; its splits are
+bundled and pinned to an upstream revision, so preprocessing needs no network.
+Launch configs and the remote-training recipe live under `examples/injecagent/`.
+The reward path calls a hosted model, so it needs `OPENAI_API_KEY` and costs
+money per training step — never fan it out casually to "test something."
+
+---
+
 ## Domain-Specific Guides
 
 Do not modify code in these areas without first reading and following the
