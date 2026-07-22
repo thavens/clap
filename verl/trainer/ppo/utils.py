@@ -86,6 +86,19 @@ def need_teacher_policy(
     return is_distillation_enabled(config.get("distillation"))
 
 
+def need_self_distillation(
+    config: DictConfig,
+) -> bool:
+    """Given the config, is SDPO self-distillation enabled.
+
+    Deliberately distinct from ``need_teacher_policy``: SDPO's teacher is the same
+    policy scoring a feedback-augmented prompt via an in-trainer forward, so it must
+    NOT trigger the served-teacher resource pool.
+    """
+    sdpo_config = config.get("sdpo")
+    return sdpo_config is not None and sdpo_config.get("enabled", False)
+
+
 def need_reward_model(
     config: DictConfig,
 ) -> bool:

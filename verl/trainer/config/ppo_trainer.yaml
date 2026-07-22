@@ -42,6 +42,9 @@ defaults:
   # distillation config
   - distillation@distillation: distillation
 
+  # SDPO self-distillation config
+  - sdpo@sdpo: sdpo
+
   # load the reference default config, then apply the fields in the current yaml
   # self config override anything above
   - _self_

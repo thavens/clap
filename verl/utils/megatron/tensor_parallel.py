@@ -170,6 +170,22 @@ def vocab_parallel_entropy_with_chunking(vocab_parallel_logits: torch.Tensor, ch
     return entropy
 
 
+def _vocab_parallel_shifted_exp(vocab_parallel_logits: torch.Tensor, group) -> tuple[torch.Tensor, ...]:
+    """Max-shift vocab-parallel logits and tp-reduce the softmax denominator.
+
+    Returns ``(shifted, exp_shifted, sum_exp)``, where ``shifted`` is the local shard minus
+    the *global* max and ``sum_exp`` is the *global* ``sum(exp(shifted))`` over the full
+    vocab. Non-destructive, so callers can still consume ``vocab_parallel_logits`` after.
+    """
+    logits_max = vocab_parallel_logits.max(dim=-1, keepdim=True).values
+    dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=group)
+    shifted = vocab_parallel_logits - logits_max
+    exp_shifted = shifted.exp()
+    sum_exp = exp_shifted.sum(dim=-1, keepdim=True)
+    dist.all_reduce(sum_exp, group=group)
+    return shifted, exp_shifted, sum_exp
+
+
 def vocab_parallel_sum_pi_squared(vocab_parallel_logits: torch.Tensor) -> torch.Tensor:
     """Compute Σπ² (sum of squared probabilities) when logits are sharded across tp ranks.
 
@@ -187,12 +203,7 @@ def vocab_parallel_sum_pi_squared(vocab_parallel_logits: torch.Tensor) -> torch.
     """
     tp_group = mpu.get_tensor_model_parallel_group()
 
-    logits_max = vocab_parallel_logits.max(dim=-1, keepdim=True).values
-    dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=tp_group)
-    shifted = vocab_parallel_logits - logits_max
-    exp_shifted = shifted.exp()
-    sum_exp = exp_shifted.sum(dim=-1, keepdim=True)
-    dist.all_reduce(sum_exp, group=tp_group)
+    _, exp_shifted, sum_exp = _vocab_parallel_shifted_exp(vocab_parallel_logits, tp_group)
     sum_exp_squared = exp_shifted.pow(2).sum(dim=-1, keepdim=True)
     dist.all_reduce(sum_exp_squared, group=tp_group)
     return (sum_exp_squared / sum_exp.pow(2)).squeeze(dim=-1)
@@ -231,3 +242,60 @@ def vocab_parallel_log_probs_from_logits_response_rmpad(input_ids, attention_mas
     )
     output = full_output.squeeze(-1)[:, -response_length - 1 : -1]  # [batch_size, response_length]
     return output
+
+
+def vocab_parallel_log_softmax_reduced(vp_logits: torch.Tensor, group=None) -> torch.Tensor:
+    """TP-reduced log-softmax over vocab-parallel logits (local shard in, local shard out).
+
+    Args:
+        vp_logits: (..., vocab_size // tp_size) local-shard logits.
+        group: process group holding the vocab shards; defaults to the megatron TP group.
+    """
+    if group is None:
+        group = mpu.get_tensor_model_parallel_group()
+
+    shifted, _, sum_exp = _vocab_parallel_shifted_exp(vp_logits.float(), group)
+    return shifted - sum_exp.log()
+
+
+def vocab_parallel_topk_log_probs(vp_logits: torch.Tensor, k: int, *, group=None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute the global top-k log-probs and ids from vocab-parallel logits.
+
+    Each TP rank holds a vocab shard of ``vp_logits``; this returns the same global
+    top-k on every rank. Used by the SDPO self-teacher forward to emit ``teacher_ids``
+    / ``teacher_logprobs`` (the model's own top-k), the transport the SDPO loss consumes.
+
+    Args:
+        vp_logits: (..., vocab_size // tp_size) local-shard logits (temperature already applied).
+        k: number of top candidates.
+        group: process group holding the vocab shards; defaults to the megatron TP group.
+            Overridable so the routine can be exercised on a plain process group in tests.
+
+    Returns:
+        (topk_log_probs, topk_ids) each (..., k), with ids in global vocab coordinates.
+    """
+    if group is None:
+        group = mpu.get_tensor_model_parallel_group()
+    rank, world_size = dist.get_rank(group=group), dist.get_world_size(group=group)
+
+    # Megatron shards the vocab into equal contiguous blocks (see VocabUtility), so this
+    # rank's shard covers [vocab_start_index, vocab_start_index + partition_vocab_size).
+    partition_vocab_size = vp_logits.size(-1)
+    vocab_start_index = rank * partition_vocab_size
+
+    vp_log_probs = vocab_parallel_log_softmax_reduced(vp_logits, group=group)
+
+    local_k = min(k, partition_vocab_size)
+    local_topk_log_probs, local_topk_ids = torch.topk(vp_log_probs, k=local_k, dim=-1)
+    local_topk_ids = local_topk_ids + vocab_start_index
+
+    gathered_log_probs = [torch.empty_like(local_topk_log_probs) for _ in range(world_size)]
+    gathered_ids = [torch.empty_like(local_topk_ids) for _ in range(world_size)]
+    dist.all_gather(gathered_log_probs, local_topk_log_probs, group=group)
+    dist.all_gather(gathered_ids, local_topk_ids, group=group)
+
+    # The global top-k is the top-k of the concatenated per-shard top-k candidates.
+    candidate_log_probs = torch.cat(gathered_log_probs, dim=-1)
+    candidate_ids = torch.cat(gathered_ids, dim=-1)
+    topk_log_probs, positions = torch.topk(candidate_log_probs, k=k, dim=-1)
+    return topk_log_probs, torch.gather(candidate_ids, dim=-1, index=positions)

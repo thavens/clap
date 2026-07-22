@@ -288,8 +288,22 @@ def compute_forward_kl_topk(
         teacher_topk_log_probs_cp_split, *_ = preprocess_thd_engine(teacher_topk_log_probs, pre_process=True)
         teacher_topk_ids_cp_split, *_ = preprocess_thd_engine(teacher_topk_ids, pre_process=True)
     else:
-        teacher_topk_log_probs_cp_split, *_ = preprocess_bshd_engine(teacher_topk_log_probs, pre_process=True)
-        teacher_topk_ids_cp_split, *_ = preprocess_bshd_engine(teacher_topk_ids, pre_process=True)
+        # The teacher must pad to the SAME target length the student logits already use: the
+        # mini-batch global max, not preprocess_bshd_engine's default per-micro-batch max (smaller
+        # whenever a micro-batch is shorter than the mini-batch). The student's target is
+        # recoverable from its own local seqlen, and re-applying the TP/CP alignment to an
+        # already-aligned length is idempotent. Requires sequence_parallel=False, else
+        # student_logits is seqlen/TP and the teacher's real tokens do not fit.
+        from megatron.core.parallel_state import get_context_parallel_world_size
+
+        cp_size = get_context_parallel_world_size()
+        forced_max_seqlen = student_logits.shape[1] * cp_size
+        teacher_topk_log_probs_cp_split, *_ = preprocess_bshd_engine(
+            teacher_topk_log_probs, pre_process=True, forced_max_seqlen=forced_max_seqlen
+        )
+        teacher_topk_ids_cp_split, *_ = preprocess_bshd_engine(
+            teacher_topk_ids, pre_process=True, forced_max_seqlen=forced_max_seqlen
+        )
     assert teacher_topk_log_probs_cp_split.shape[:2] == teacher_topk_ids_cp_split.shape[:2] == student_logits.shape[:2]
 
     # 2. compute token-wise KL divergence across tp groups

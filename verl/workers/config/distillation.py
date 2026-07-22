@@ -38,6 +38,8 @@ class DistillationLossConfig(BaseConfig):
         Number of top tokens to consider for top-k distillation losses.
     use_task_rewards (bool):
         Whether to include task rewards alongside distillation loss.
+    task_loss_coef (float):
+        Coefficient for task-reward policy loss when combined with distillation loss.
     distillation_loss_coef (float):
         Coefficient for distillation loss when combined with task rewards.
     loss_max_clamp (float, optional):
@@ -65,6 +67,7 @@ class DistillationLossConfig(BaseConfig):
     loss_mode: str = "k3"
     topk: Optional[int] = 128
     use_task_rewards: bool = True
+    task_loss_coef: float = 1.0
     distillation_loss_coef: float = 1.0
     loss_max_clamp: Optional[float] = 10.0
     log_prob_min_clamp: Optional[float] = -10.0

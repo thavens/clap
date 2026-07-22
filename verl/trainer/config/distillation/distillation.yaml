@@ -29,8 +29,8 @@ distillation_loss:
   # Whether to include task rewards alongside distillation loss.
   use_task_rewards: true
 
-
-  # The coef of the distillation loss when use_task_rewards is true
+  # Coefficients when task rewards and distillation are combined.
+  task_loss_coef: 1.0
   distillation_loss_coef: 1.0
 
   # Optional max clamp value for distillation loss. If null, no clamping is applied.

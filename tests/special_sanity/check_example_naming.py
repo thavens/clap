@@ -105,6 +105,13 @@ DEFAULT_IGNORE_FILES = (
     # folding ``_multi_rs`` into a ROLLOUT_SERVER env-var toggle rather than
     # in this PR.
     "examples/rollout_correction/run_qwen2_5_7b_fsdp_multi_rs.sh",
+    # CLAP research recipes: thin delegating wrappers over
+    # run_qwen3_5_4b_megatron.sh that only override the objective and the
+    # reward. The trailing tokens name the RL objective and the task, not an
+    # inference backend / platform / quantization variant, so the env-var-
+    # toggle migration this convention prescribes does not apply.
+    "examples/injecagent/run_qwen3_5_4b_megatron_sdpo.sh",
+    "examples/injecagent/run_qwen3_5_4b_megatron_sdpo_exclaim.sh",
 )
 
 

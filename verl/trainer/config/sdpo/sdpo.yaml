@@ -1,0 +1,74 @@
+# Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+_target_: verl.workers.config.SelfDistillationConfig
+
+# Whether to enable SDPO self-distillation.
+enabled: false
+
+# Divergence interpolation: 0.0 forward KL (teacher||student), 1.0 reverse KL, in between JSD.
+# Only alpha=0 is supported on the Megatron top-k reuse path; alpha>0 is deferred.
+alpha: 0.0
+
+# Append a tail bucket so truncated top-k distributions are proper (vs. renormalizing).
+add_tail: true
+
+# NOT IMPLEMENTED, must stay null (setting it raises). Reserved for an importance-sampling
+# clip on exp(logp - old_logp).
+is_clip: null
+
+# A rollout is a successful "solution" demonstration for its group when reward >= this.
+success_reward_threshold: 1.0
+
+# Use the per-rollout `feedback` string from the reward as part of the teacher prompt.
+include_environment_feedback: true
+
+# Only inject environment feedback for samples without a successful sibling solution.
+environment_feedback_only_without_solution: false
+
+# Exclude a sample's own response when picking a sibling solution demonstration.
+dont_reprompt_on_self_success: true
+
+# Strip <think>...</think> spans from demonstrated solutions.
+remove_thinking_from_demonstration: false
+
+# Token budget for the reprompted teacher prompt (before the response is appended).
+max_reprompt_len: 3072
+
+# Truncation side when the reprompt exceeds max_reprompt_len: right | left | error.
+reprompt_truncation: right
+
+# Run the teacher forward with the LoRA adapter disabled (frozen base teacher) vs. same base+adapter.
+teacher_use_base_model: false
+
+# NOT IMPLEMENTED, must stay none/0.0 (setting either raises). Reserved for ema | trust-region
+# teacher stabilization; none is also the paper base method when ppo_epochs==1.
+teacher_regularization: none
+teacher_update_rate: 0.0
+
+# SDPO loss config, reused from the OPD subsystem. use_task_rewards controls GRPO composition.
+distillation_loss:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.DistillationLossConfig
+
+  # SDPO top-k self-distillation divergence.
+  loss_mode: self_distill_jsd_topk
+
+  # Number of student top-k candidates retained per token.
+  topk: 100
+
+  # Pure SDPO when false; set true to combine task-reward PG and SDPO losses.
+  use_task_rewards: false
+
+  # Coefficients on the task-reward and SDPO terms when use_task_rewards is true.
+  # For a convex alpha interpolation, set these to (1 - alpha) and alpha respectively.
+  task_loss_coef: 1.0
+  distillation_loss_coef: 1.0
+
+  # Optional max clamp on the distillation loss. null = no clamping.
+  loss_max_clamp: null
+
+  # Optional min clamp on log probabilities for stability. null = no clamping.
+  log_prob_min_clamp: null
+
+  # SDPO backpropagates the divergence directly as a supervised loss, not as a reward.
+  use_policy_gradient: false

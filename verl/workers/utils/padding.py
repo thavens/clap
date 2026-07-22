@@ -229,3 +229,43 @@ def response_to_nested(tensor: torch.Tensor, response_mask: torch.Tensor) -> tor
         response_list.append(tensor[i, : response_lens[i]])
 
     return torch.nested.as_nested_tensor(response_list, layout=torch.jagged)
+
+
+def response_to_sequence_nested(
+    tensor: torch.Tensor,
+    prompt_lens: torch.Tensor,
+    response_lens: torch.Tensor,
+    fill_value: float = 0.0,
+) -> torch.Tensor:
+    """Scatter a padded per-response tensor back over the full [prompt | response] sequence.
+
+    The inverse of ``response_from_nested``: response element ``j`` is written at the position
+    that *predicts* it, i.e. valid index ``prompt_len - 1 + j``, so the result lines up with a
+    model output over the whole sequence. Positions outside the response window get
+    ``fill_value``. Per-sample valid lengths are preserved (nested, not padded to a fixed
+    width) so downstream padding targets the same seqlen the model's own output does.
+
+    Args:
+        tensor: (bsz, max_response_len, *) padded response-aligned values.
+        prompt_lens: (bsz,) per-sample prompt length; must be > 0.
+        response_lens: (bsz,) per-sample response length.
+        fill_value: value written outside the response window.
+
+    Returns:
+        a nested tensor with shape (bsz, prompt_len + response_len, *)
+    """
+    assert not tensor.is_nested, "tensor must be padded, not nested"
+    assert not prompt_lens.eq(0).any(), f"prompt_len > 0 is required to place the response, got {prompt_lens}"
+
+    dense_shape = tuple(tensor.shape[2:])
+    sequence_list = []
+    for i in range(tensor.shape[0]):
+        prompt_len, response_len = int(prompt_lens[i]), int(response_lens[i])
+        sequence = torch.full(
+            (prompt_len + response_len, *dense_shape), fill_value, dtype=tensor.dtype, device=tensor.device
+        )
+        start = prompt_len - 1
+        sequence[start : start + response_len] = tensor[i, :response_len]
+        sequence_list.append(sequence)
+
+    return torch.nested.as_nested_tensor(sequence_list, layout=torch.jagged)

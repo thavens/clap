@@ -782,6 +782,7 @@ distillation:
     loss_mode: k3
     topk: 32
     use_task_rewards: true
+    task_loss_coef: 1.0
     distillation_loss_coef: 1.0
     loss_max_clamp: null
     log_prob_min_clamp: null

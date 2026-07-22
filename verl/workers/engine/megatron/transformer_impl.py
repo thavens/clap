@@ -912,6 +912,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
         calculate_entropy: bool,
         distillation_use_topk: bool,
         distillation_only: bool,
+        compute_self_teacher_topk: bool,
         logits_processor_func: Callable,
         batch: TensorDict,
         data_format: str,
@@ -946,10 +947,24 @@ class MegatronEngineWithLMHead(MegatronEngine):
         else:
             logits_bak = logits
 
+        # SDPO self-teacher forward: emit the model's OWN global top-k (teacher_logprobs / teacher_ids)
+        # from the vocab-parallel logits, the transport the SDPO loss consumes on the next (student)
+        # forward. Independent of logits_processor_func (the infer path passes it as None), and does
+        # not consume teacher_ids (unlike the distillation_use_topk branch, which gathers at them).
+        if compute_self_teacher_topk:
+            from verl.utils.megatron.tensor_parallel import vocab_parallel_topk_log_probs
+
+            k = tu.get_non_tensor_data(data=batch, key="self_teacher_topk_k", default=None)
+            assert k is not None, "self_teacher_topk_k must be set for the SDPO self-teacher forward"
+            teacher_topk_log_probs, teacher_topk_ids = vocab_parallel_topk_log_probs(logits_bak, k)
+            # (bsz, seqlen/cp_size, k) — sliced to response positions downstream like log_probs.
+            ret["teacher_logprobs"] = teacher_topk_log_probs
+            ret["teacher_ids"] = teacher_topk_ids
+
         # logits_processor_func return tensors with shape (1, total_nnz/cp_size)
         if distillation_use_topk:
             ret.update(logits_processor_func(student_logits=logits_bak, data=batch, data_format=data_format))
-        if not distillation_only:
+        if not distillation_only and not compute_self_teacher_topk:
             ret["log_probs"] = vocab_parallel_log_probs_from_logits(logits_bak, label)
 
         return ret
@@ -976,6 +991,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
         distillation_only = tu.get_non_tensor_data(batch, key="distillation_only", default=False)
+        compute_self_teacher_topk = tu.get_non_tensor_data(batch, key="compute_self_teacher_topk", default=False)
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
@@ -1068,6 +1084,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 calculate_entropy=calculate_entropy,
                 distillation_use_topk=distillation_use_topk,
                 distillation_only=distillation_only,
+                compute_self_teacher_topk=compute_self_teacher_topk,
                 logits_processor_func=logits_processor_func,
                 batch=batch,
                 data_format=data_format,

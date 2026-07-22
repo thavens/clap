@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import json
 import logging
 import math
@@ -69,6 +70,7 @@ from verl.trainer.ppo.utils import (
     create_rl_sampler,
     need_critic,
     need_reference_policy,
+    need_self_distillation,
     need_teacher_policy,
 )
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer
@@ -87,11 +89,11 @@ from verl.utils.py_functional import rename_dict
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.skip import SkipManager
 from verl.utils.tracking import Tracking, ValidationGenerationsLogger
-from verl.workers.config import CriticConfig, DistillationConfig
+from verl.workers.config import CriticConfig, DistillationConfig, SelfDistillationConfig
 from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker, TrainingWorkerConfig
 from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
 from verl.workers.utils.losses import value_loss
-from verl.workers.utils.padding import response_from_nested, response_to_nested
+from verl.workers.utils.padding import response_from_nested, response_to_nested, response_to_sequence_nested
 
 
 def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
@@ -187,6 +189,7 @@ class PPOTrainer(ABC):
             cls=self.role_worker_mapping[actor_role],
             config=self.config.actor_rollout_ref,
             distillation_config=self.config.get("distillation"),
+            sdpo_config=self.config.get("sdpo"),
             role=str(actor_role),
         )
         self.resource_pool_to_cls[actor_rollout_resource_pool][str(actor_role)] = actor_rollout_cls
@@ -283,6 +286,20 @@ class PPOTrainer(ABC):
         else:
             self.teacher_model_manager = None
             self.distillation_config = None
+
+        # SDPO self-distillation: the teacher is the same policy scoring a feedback-augmented
+        # prompt via an in-trainer forward (see _compute_self_teacher_topk). It reuses the OPD
+        # top-k transport/loss but must NOT allocate a served-teacher pool, so it is gated
+        # separately from use_teacher_policy.
+        self.sdpo_enabled = need_self_distillation(self.config)
+        if self.sdpo_enabled and self.use_teacher_policy:
+            raise ValueError(
+                "SDPO (sdpo.enabled) and served-teacher distillation (distillation.enabled) are mutually "
+                "exclusive: they share the top-k engine hook but source the teacher differently."
+            )
+        self.sdpo_config: SelfDistillationConfig | None = (
+            omega_conf_to_dataclass(self.config.sdpo) if self.sdpo_enabled else None
+        )
 
         # 9. initialize agent loop manager
         self.llm_server_manager: LLMServerManager = LLMServerManager.create(
@@ -501,6 +518,11 @@ class PPOTrainer(ABC):
         # 7. compute advantage and return
         with marked_timer("adv", timing_raw, color="brown"):
             batch = self._compute_advantage(batch, metrics=metrics)
+
+        # 7b. [OPTIONAL] SDPO self-teacher forward: emit teacher top-k over reprompted sequences.
+        if self.sdpo_enabled:
+            with marked_timer("sdpo_teacher", timing_raw, color="green"):
+                batch = self._compute_self_teacher_topk(batch, metrics=metrics)
 
         # 8. [OPTIONAL] update critic
         if self.use_critic:
@@ -1350,6 +1372,16 @@ class PPOTrainer(ABC):
 
         return batch
 
+    @contextlib.contextmanager
+    def _tokenizer_sides(self, *, padding_side: str, truncation_side: str):
+        """Temporarily set the shared tokenizer's padding/truncation sides, restoring both after."""
+        prev_padding, prev_truncation = self.tokenizer.padding_side, self.tokenizer.truncation_side
+        self.tokenizer.padding_side, self.tokenizer.truncation_side = padding_side, truncation_side
+        try:
+            yield self.tokenizer
+        finally:
+            self.tokenizer.padding_side, self.tokenizer.truncation_side = prev_padding, prev_truncation
+
     @staticmethod
     def _lengths_to_mask(lengths: torch.Tensor, width: int) -> torch.Tensor:
         """Build a right-padded mask of shape (len(lengths), width) from per-row valid lengths."""
@@ -1488,6 +1520,162 @@ class PPOTrainer(ABC):
 
         return batch
 
+    def _compute_self_teacher_topk(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """SDPO: score the same responses under a feedback-augmented prompt and emit teacher top-k.
+
+        Runs after reward/advantage and before _update_actor. Builds the reprompted teacher
+        sequence ``[teacher_prompt | response]`` per sample, runs an in-trainer no-grad forward
+        of the same actor weights, and writes the model's own top-k (``teacher_logprobs`` /
+        ``teacher_ids``) plus the per-sample ``self_distillation_mask`` back to TransferQueue, so
+        the SDPO top-k loss consumes them on the student update forward. The worker method
+        ``compute_self_teacher_topk`` renames the teacher_* fields to input_ids/etc.
+        """
+        from verl.trainer.ppo.sdpo_reprompt import build_teacher_messages
+        from verl.utils.model import compute_position_id_with_mask
+
+        cfg = self.sdpo_config
+        assert cfg is not None, "_compute_self_teacher_topk requires sdpo.enabled"
+
+        # 1. read the fields needed to build the reprompt. Per-rollout feedback text may live as
+        # a top-level `feedback` field or nested in `extra_fields[i]["reward_extra_info"]`,
+        # depending on the reward path; request both (kv_batch_get silently drops absent fields).
+        fields = ["prompts", "responses", "raw_prompt", "uid", "rm_scores"]
+        if cfg.include_environment_feedback:
+            fields += ["feedback", "extra_fields"]
+        data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+
+        response_lengths = data["responses"].offsets().diff()
+        responses = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
+        response_mask = self._lengths_to_mask(response_lengths, responses.size(1))
+        bsz = len(batch)
+
+        response_texts = [
+            self.tokenizer.decode(responses[i, : response_lengths[i]], skip_special_tokens=True) for i in range(bsz)
+        ]
+        raw_prompts = list(data["raw_prompt"])
+        prompt_texts = [msgs[-1]["content"] for msgs in raw_prompts]
+        uids = list(data["uid"])
+        seq_scores = data["rm_scores"].to_padded_tensor(padding=0.0).sum(dim=-1).tolist()
+
+        feedback_raw = None
+        if cfg.include_environment_feedback:
+            if "feedback" in data.keys():
+                feedback_raw = list(data["feedback"])
+            elif "extra_fields" in data.keys():
+                feedback_raw = [
+                    (ef.get("reward_extra_info", {}) if isinstance(ef, dict) else {}).get("feedback")
+                    for ef in list(data["extra_fields"])
+                ]
+
+        # 2. decide which samples get reprompted and assemble the teacher chat messages.
+        messages, sd_mask_list, sdpo_metrics = build_teacher_messages(
+            cfg, raw_prompts, prompt_texts, response_texts, uids, seq_scores, feedback_raw
+        )
+        metrics.update(sdpo_metrics)
+
+        # 3. tokenize the reprompted prefixes and append the SAME response tokens.
+        ct_kwargs = self.config.data.get("apply_chat_template_kwargs", None) or {}
+        enable_thinking = ct_kwargs.get("enable_thinking", True)
+        # `error` means "do not truncate, fail instead", so tokenize unbounded and check below.
+        truncate = cfg.reprompt_truncation != "error"
+        truncation_side = "left" if cfg.reprompt_truncation == "left" else "right"
+        # Left-pad the (variable-length) reprompted prefixes so each teacher sequence is
+        # [pad | teacher_prompt | response] with the response as the trailing valid tokens,
+        # matching how response_from_nested extracts the response region below.
+        with self._tokenizer_sides(padding_side="left", truncation_side=truncation_side):
+            teacher_prompt = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                return_tensors="pt",
+                return_dict=True,
+                add_generation_prompt=True,
+                padding=True,
+                truncation=truncate,
+                max_length=cfg.max_reprompt_len,
+                enable_thinking=enable_thinking,
+            )
+        if not truncate and teacher_prompt["input_ids"].shape[1] > cfg.max_reprompt_len:
+            raise ValueError(
+                f"SDPO reprompt is {teacher_prompt['input_ids'].shape[1]} tokens, over the "
+                f"sdpo.max_reprompt_len budget of {cfg.max_reprompt_len}. Raise the budget or set "
+                "sdpo.reprompt_truncation to 'left'/'right' to truncate instead."
+            )
+        device = responses.device
+        teacher_prompt_ids = teacher_prompt["input_ids"].to(device)
+        teacher_prompt_mask = teacher_prompt["attention_mask"].to(device)
+        teacher_input_ids = torch.cat([teacher_prompt_ids, responses], dim=1)
+        teacher_attention_mask = torch.cat([teacher_prompt_mask, response_mask], dim=1)
+        teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
+        self_distillation_mask = torch.tensor(sd_mask_list, dtype=torch.float32, device=device)
+
+        # 4. write the teacher sequence + mask back to TransferQueue for the worker forward.
+        write_back = tu.get_tensordict(
+            {
+                "teacher_input_ids": teacher_input_ids,
+                "teacher_attention_mask": teacher_attention_mask,
+                "teacher_position_ids": teacher_position_ids,
+                "self_distillation_mask": self_distillation_mask,
+            }
+        )
+        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=write_back)
+
+        # 5. run the self-teacher forward (same weights, no grad, no loss). Use a fresh meta with
+        # fields=None so ALL current TQ fields resolve on the worker (including the teacher_* just
+        # written); the incoming `batch.fields` is a fixed schema that excludes them. The worker
+        # renames teacher_* -> the standard input fields and returns the model's own top-k.
+        teacher_batch = KVBatchMeta(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            tags=getattr(batch, "tags", None),
+        )
+        teacher_batch.extra_info = {
+            "calculate_entropy": False,
+            "compute_loss": False,
+            "compute_self_teacher_topk": True,
+            "self_teacher_topk_k": cfg.distillation_loss.topk,
+            "no_lora_adapter": cfg.teacher_use_base_model,
+            "temperature": self.config.actor_rollout_ref.rollout.temperature,
+        }
+        output = self.actor_rollout_wg.compute_self_teacher_topk(teacher_batch)
+        assert len(output) == len(batch)
+
+        # 6. read back the teacher top-k (auto-collected over the TEACHER sequence) and re-map it
+        # onto the STUDENT's valid sequence [prompt | response]. The result stays NESTED: the
+        # megatron top-k kernel pads it to the same mini-batch max the student logits use, which a
+        # fixed prompt_width+response_width tensor would overshoot.
+        result = tq.kv_batch_get(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            select_fields=["teacher_logprobs", "teacher_ids", "response_mask", "prompts"],
+        )
+        tl, ti, rm, prompts_nested = (
+            result["teacher_logprobs"],
+            result["teacher_ids"],
+            result["response_mask"],
+            result["prompts"],
+        )
+        # response-align (index j = the teacher distribution that predicts response token j).
+        resp_lp = response_from_nested(tl, rm) if tl.is_nested else tl
+        resp_ids = response_from_nested(ti, rm) if ti.is_nested else ti
+        resp_lp = resp_lp.to_padded_tensor(0.0) if resp_lp.is_nested else resp_lp
+        resp_ids = resp_ids.to_padded_tensor(0) if resp_ids.is_nested else resp_ids
+        prompt_lens = prompts_nested.offsets().diff()
+        response_lens = rm.offsets().diff() if rm.is_nested else rm.sum(dim=-1)
+        write = tu.get_tensordict(
+            {
+                "teacher_logprobs": response_to_sequence_nested(resp_lp, prompt_lens, response_lens),
+                "teacher_ids": response_to_sequence_nested(
+                    resp_ids, prompt_lens, response_lens, fill_value=self.tokenizer.pad_token_id
+                ),
+            }
+        )
+        # Rebind `batch` to the put result: kv_batch_put returns a meta whose `.fields` lists ALL
+        # persisted fields, so this is what makes _update_actor's dispatch fetch teacher_* (the
+        # incoming batch.fields schema does not include them). Mirrors _compute_old_log_prob.
+        batch = tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=write)
+
+        return batch
+
     def _compute_values(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the values of the batch."""
         # 1. compute value
@@ -1601,18 +1789,23 @@ class PPOTrainer(ABC):
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
             self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         )
+        # Both served-teacher distillation and SDPO drive the same top-k engine hook; pick
+        # whichever loss config is active (they are mutually exclusive, checked in _setup).
+        if is_distillation_enabled(self.config.get("distillation")):
+            active_distill_loss_cfg = self.distillation_config.distillation_loss
+        elif self.sdpo_enabled:
+            active_distill_loss_cfg = self.sdpo_config.distillation_loss
+        else:
+            active_distill_loss_cfg = None
         distillation_use_topk = (
-            self.distillation_config.distillation_loss.loss_settings.use_topk
-            if is_distillation_enabled(self.config.get("distillation"))
-            else False
+            active_distill_loss_cfg.loss_settings.use_topk if active_distill_loss_cfg is not None else False
         )
         distillation_only = False  # distillation_only flag means we can skip policy loss and reduce mem footprint
-        if is_distillation_enabled(self.config.get("distillation")):
-            distillation_loss_cfg = self.distillation_config.distillation_loss
+        if active_distill_loss_cfg is not None:
             distillation_only = (
                 distillation_use_topk
-                and not distillation_loss_cfg.use_task_rewards
-                and not distillation_loss_cfg.use_policy_gradient
+                and not active_distill_loss_cfg.use_task_rewards
+                and not active_distill_loss_cfg.use_policy_gradient
             )
         extra_info = {
             "calculate_entropy": calculate_entropy,

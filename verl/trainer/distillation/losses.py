@@ -215,6 +215,8 @@ def distillation_ppo_loss(
         policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
         if not distillation_loss_config.use_task_rewards:
             policy_loss = 0.0
+        else:
+            policy_loss *= distillation_loss_config.task_loss_coef
 
     # Combine distillation with policy loss
     policy_metrics.update(distill_metrics)
@@ -223,6 +225,13 @@ def distillation_ppo_loss(
     )
     policy_loss += distill_loss * distillation_loss_coef
     policy_metrics["distillation/loss"] = Metric(value=distill_loss, aggregation=AggregationType.SUM)
+    if distillation_loss_config.use_task_rewards:
+        policy_metrics["distillation/task_loss_coef"] = Metric(
+            value=distillation_loss_config.task_loss_coef, aggregation=AggregationType.MEAN
+        )
+        policy_metrics["distillation/loss_coef"] = Metric(
+            value=distillation_loss_coef, aggregation=AggregationType.MEAN
+        )
 
     return policy_loss, policy_metrics
 
@@ -251,6 +260,18 @@ def distillation_loss(
     )
     response_mask = data["response_mask"]
     loss_agg_mode = config.loss_agg_mode
+
+    # SDPO: restrict the distillation term to reprompted samples (where the teacher's
+    # feedback-augmented prompt differs from the student's, so the divergence is non-trivial).
+    # Folding the per-sample self_distillation_mask into the aggregation mask excludes
+    # non-reprompted samples from both numerator and denominator, matching the reference
+    # `loss_mask = response_mask * self_distillation_mask`. Only the distillation term is
+    # affected; ppo_loss reads response_mask independently from `data`.
+    sd_mask = data.get("self_distillation_mask", None)
+    if sd_mask is not None:
+        if response_mask.is_nested:
+            response_mask = response_mask.to_padded_tensor(False)
+        response_mask = response_mask * sd_mask.reshape(-1, *([1] * (response_mask.dim() - 1))).to(response_mask)
 
     distillation_metrics.update(
         compute_distillation_loss_range(distillation_losses=distillation_losses, response_mask=response_mask)
@@ -358,6 +379,63 @@ def compute_forward_kl_topk(
     # Due to use of top-k, student and teacher distributions don't sum to 1 -> divergences can be negative.
     distillation_losses = distillation_losses.clamp_min(0.0)
 
+    return distillation_losses, distillation_metrics
+
+
+@register_distillation_loss(DistillationLossSettings(names=["self_distill_jsd_topk"], use_topk=True))  # type: ignore[arg-type]
+def compute_self_distill_jsd_topk(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """SDPO self-distillation top-k loss (metric phase).
+
+    Reuses the vocab-parallel forward-KL processor outputs (``distillation_losses`` =
+    truncated forward KL over the teacher's top-k, plus ``student_mass`` / ``teacher_mass``)
+    and reconstructs SDPO's tail-bucketed or renormalized forward KL from them via
+    ``forward_kl_from_masses`` -- no student log-probs at teacher ids are needed here.
+
+    ``distillation_config`` is a ``SelfDistillationConfig`` standing in for the distillation
+    config; see ``verl/workers/config/sdpo.py`` for that contract.
+
+    Only ``alpha == 0`` (forward KL) is supported on this reuse path. ``alpha > 0``
+    (reverse KL / JSD) additionally needs the student's own top-k support and is deferred.
+
+    Returns:
+    - distillation_losses: (bsz, resp_len)
+    - distillation_metrics
+    """
+    from verl.trainer.distillation.sdpo_math import forward_kl_from_masses
+
+    alpha, add_tail = distillation_config.alpha, distillation_config.add_tail
+    if alpha != 0.0:
+        raise NotImplementedError(
+            "SDPO alpha > 0 (reverse KL / JSD) needs the student's own top-k support and is not yet "
+            f"implemented on the top-k logits-processor path; only alpha=0 (forward KL) is supported (got {alpha}). "
+            "Set sdpo.alpha=0.0."
+        )
+
+    truncated_fkl = no_padding_2_padding(model_output["distillation_losses"], data)
+    student_mass = no_padding_2_padding(model_output["student_mass"], data)
+    teacher_mass = no_padding_2_padding(model_output["teacher_mass"], data)
+    if data["response_mask"].is_nested:
+        response_mask_bool = data["response_mask"].bool().to_padded_tensor(False)
+    else:
+        response_mask_bool = data["response_mask"].bool()
+    assert truncated_fkl.shape == student_mass.shape == teacher_mass.shape == response_mask_bool.shape
+
+    distillation_losses = forward_kl_from_masses(truncated_fkl, student_mass, teacher_mass, add_tail)
+    # A proper forward KL is >= 0; truncation of the top-k support can make the raw value
+    # slightly negative, so clamp (matches compute_forward_kl_topk).
+    distillation_losses = distillation_losses.clamp_min(0.0)
+
+    valid_student_mass = student_mass[response_mask_bool]
+    valid_teacher_mass = teacher_mass[response_mask_bool]
+    distillation_metrics = {
+        "sdpo/student_mass": valid_student_mass.mean().item() if valid_student_mass.numel() else 0.0,
+        "sdpo/teacher_mass": valid_teacher_mass.mean().item() if valid_teacher_mass.numel() else 0.0,
+    }
     return distillation_losses, distillation_metrics
 
 

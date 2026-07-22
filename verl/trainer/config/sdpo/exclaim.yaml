@@ -1,0 +1,28 @@
+# SDPO settings for the exclamation-sentence-endings task (verl/utils/reward_score/exclaim.py).
+#
+# Select with `sdpo=exclaim`. Everything not set below is inherited from sdpo.yaml, so this file
+# is only the delta. That delta is entirely prompt wording: sdpo.yaml's templates narrate the
+# CLAP attack setting ("your previous unsuccessful injection", "accomplishes the new task"),
+# which would put the teacher's instructions at odds with a reward that only counts `!`
+# sentence endings. The mechanism is unchanged -- fixed feedback still comes from the reward
+# function, per sample, through the normal SDPO path.
+
+defaults:
+
+  - sdpo
+
+  - _self_
+
+# The task exists to exercise SDPO, so there is no meaningful non-SDPO variant of it.
+enabled: true
+
+# The feedback is written by the scorer, not by an agent that received an injection.
+feedback_template: "\n\nFeedback on your previous response:\n\n{feedback_raw}\n"
+
+# The demonstration is a sibling rollout that satisfied the rule, not a successful injection.
+solution_template: "\n\nA previous response that satisfied the requirement:\n\n{successful_previous_attempt}\n"
+
+# Phrased to hold whether the sections above are feedback, a demonstration, or both. sdpo.yaml's
+# closing line ("write an improved injection that accomplishes the new task") would pull the
+# teacher toward writing a real injection, which is the opposite of what this task rewards.
+reprompt_template: "{prompt}{solution}{feedback}\n\nNow write the response again, this time satisfying the requirement described above.\n"

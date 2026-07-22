@@ -443,12 +443,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     ref_worker_cls = TrainingWorker
 
     def __init__(
-        self, config: DictConfig, role: str, distillation_config: Optional[DistillationConfig] = None, **kwargs
+        self,
+        config: DictConfig,
+        role: str,
+        distillation_config: Optional[DistillationConfig] = None,
+        sdpo_config: Optional[DictConfig] = None,
+        **kwargs,
     ):
         Worker.__init__(self)
         self.config = config
         self.distillation_config = distillation_config
         self.distillation_enabled = is_distillation_enabled(distillation_config)
+        # SDPO reuses distillation_ppo_loss with a SelfDistillationConfig standing in for the
+        # distillation config (see verl/workers/config/sdpo.py). Gated separately from the
+        # served-teacher path so no teacher servers are launched.
+        self.sdpo_config = sdpo_config
+        self.sdpo_enabled = sdpo_config is not None and sdpo_config.get("enabled", False)
         self.role = role
         self.actor: TrainingWorker | None = None
         self.ref: TrainingWorker | None = None
@@ -584,6 +594,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.loss_fn = partial(
                     distillation_ppo_loss, config=actor_config, distillation_config=distillation_config
                 )
+            elif self.sdpo_enabled:
+                sdpo_config_obj = omega_conf_to_dataclass(self.sdpo_config)
+                self.loss_fn = partial(distillation_ppo_loss, config=actor_config, distillation_config=sdpo_config_obj)
             else:
                 self.loss_fn = partial(ppo_loss, config=actor_config)
             self.actor = self.actor_worker_cls(config=actor_training_config)
@@ -646,6 +659,33 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     @_with_routing_replay_flag(enabled=True)
     def compute_log_prob(self, data: TensorDict) -> TensorDict:
+        output = self.actor.infer_batch(data)
+
+        return output.cpu() if output is not None else None
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="green", role="actor_self_teacher_topk")
+    @_with_routing_replay_flag(enabled=True)
+    def compute_self_teacher_topk(self, data: TensorDict) -> TensorDict:
+        """SDPO self-teacher forward: emit the model's own top-k over a reprompted sequence.
+
+        The trainer arranges ``data`` so that the teacher (feedback-augmented prompt + the
+        SAME sampled response) occupies the standard ``input_ids`` / ``attention_mask`` /
+        ``position_ids`` fields, and sets non-tensor flags ``compute_self_teacher_topk=True``,
+        ``self_teacher_topk_k``, ``compute_loss=False`` (so no loss fn runs) and, for the
+        base-model teacher variant, ``no_lora_adapter=True``. The engine's self-top-k branch
+        (see megatron transformer_impl._lm_head_logits_processor) returns ``teacher_logprobs``
+        and ``teacher_ids``, which the SDPO loss consumes on the next student forward.
+        """
+        # Swap the teacher sequence into the standard input fields so the engine's
+        # left_right_2_no_padding forwards the feedback-augmented prompt (not the student's).
+        for teacher_key, std_key in (
+            ("teacher_input_ids", "input_ids"),
+            ("teacher_attention_mask", "attention_mask"),
+            ("teacher_position_ids", "position_ids"),
+        ):
+            assert teacher_key in data.keys(), f"{teacher_key} missing from SDPO teacher batch"
+            data[std_key] = data.pop(teacher_key)
         output = self.actor.infer_batch(data)
 
         return output.cpu() if output is not None else None
