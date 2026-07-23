@@ -112,7 +112,7 @@ not a config flag.
   of attacker/defender rollouts generated for it.
 - **CLAP attacker prompt** — the fixed template handed to the attacker policy,
   carrying the original user task, the injected task, and the tool-output
-  context with a `<PLACEHOLDER>` marker where its output is spliced in.
+  context with a `<YOUR INJECTION GOES HERE>` marker where its output is spliced in.
 
 ### Where things live
 
