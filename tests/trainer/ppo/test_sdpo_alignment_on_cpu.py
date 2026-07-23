@@ -124,3 +124,37 @@ def test_response_to_sequence_nested_inverts_response_from_nested():
     # Everything outside the response window is left at fill_value.
     for i, s in enumerate(samples):
         torch.testing.assert_close(sequence[i][: s["prompt_len"] - 1], torch.zeros(s["prompt_len"] - 1, topk).double())
+
+
+def test_full_kl_teacher_logprob_remap_round_trips():
+    """SDPO full-vocab KL: the co-located teacher's per-response-token log-softmax *vector*
+    (shape (bsz, resp_len, vocab/tp)) is remapped onto the student's [prompt | response] layout via
+    ``response_to_sequence_nested(..., fill_value=0.0)``, then ``response_from_nested`` must recover
+    it exactly. Locks the vector-payload round-trip the co-located teacher forward relies on
+    (``_sdpo_teacher_full_log_probs``), where the trailing dim is the full vocab shard, not top-k.
+    """
+    samples = [{"prompt_len": 4, "resp_len": 3}, {"prompt_len": 2, "resp_len": 5}]
+    vocab_shard = 7  # stands in for V/tp
+    prompt_lens = torch.tensor([s["prompt_len"] for s in samples])
+    response_lens = torch.tensor([s["resp_len"] for s in samples])
+    max_resp = int(response_lens.max())
+
+    padded = torch.full((len(samples), max_resp, vocab_shard), -123.0, dtype=torch.float64)
+    for i, s in enumerate(samples):
+        for j in range(s["resp_len"]):
+            padded[i, j] = torch.arange(vocab_shard, dtype=torch.float64) + 1000 * i + 10 * j
+
+    sequence = response_to_sequence_nested(padded, prompt_lens, response_lens, fill_value=0.0)
+    torch.testing.assert_close(sequence.offsets().diff(), (prompt_lens + response_lens).to(torch.int64))
+
+    response_mask = torch.nested.as_nested_tensor(
+        [torch.ones(s["resp_len"], dtype=torch.float64) for s in samples], layout=torch.jagged
+    )
+    recovered = response_from_nested(sequence, response_mask)
+    for i, s in enumerate(samples):
+        torch.testing.assert_close(recovered[i], padded[i, : s["resp_len"]])
+    # Prompt region filled with 0.0 (masked out downstream by response_mask in the loss aggregation).
+    for i, s in enumerate(samples):
+        torch.testing.assert_close(
+            sequence[i][: s["prompt_len"] - 1], torch.zeros(s["prompt_len"] - 1, vocab_shard).double()
+        )

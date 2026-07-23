@@ -533,9 +533,9 @@ class MegatronEngine(BaseEngine):
         Returns:
             grad_norm (float): The norm of the gradients before clipping or update.
         """
-        # forward_kl_topk leaves large fp32 vocab tensors until backward ends;
-        # free cached blocks before grad-norm all_reduce to reduce OOM on tight VRAM.
-        if getattr(self, "_distillation_use_topk_active", False):
+        # Top-k forward KL and SDPO full-vocab KL both leave large fp32 vocab tensors until backward
+        # ends; free cached blocks before grad-norm all_reduce to reduce OOM on tight VRAM.
+        if getattr(self, "_distillation_free_cache_active", False):
             get_torch_device().empty_cache()
         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
 
@@ -669,7 +669,9 @@ class MegatronEngine(BaseEngine):
         return torch.tensor(input_ids.numel(), device=input_ids.device)
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> Any:
-        self._distillation_use_topk_active = tu.get_non_tensor_data(data, key="distillation_use_topk", default=False)
+        self._distillation_free_cache_active = tu.get_non_tensor_data(
+            data, key="distillation_use_topk", default=False
+        ) or tu.get_non_tensor_data(data, key="distillation_use_full_kl", default=False)
         tu.assign_non_tensor(data, sp_size=self.engine_config.context_parallel_size)
 
         # compute num_tokens in global batch for loss normalization
@@ -902,6 +904,83 @@ class MegatronEngineWithLMHead(MegatronEngine):
     def prepare_model_outputs(self, output: dict, data: TensorDict):
         return output
 
+    def _sdpo_teacher_full_log_probs(
+        self, model, batch, forward_fn, per_sample_temperature, multi_modal_inputs, data_format, teacher_use_base_model
+    ):
+        """Co-located SDPO self-teacher forward -> full-vocab log-softmax in student layout.
+
+        Runs a no-grad forward of the same weights over the reprompted sequence
+        ``[teacher_prompt | response]`` (built by the trainer as ``teacher_input_ids`` etc.), takes
+        the full-vocab log-softmax at every position, then remaps the response window onto the
+        STUDENT's ``[prompt | response]`` layout so the full-KL logits processor can line it up with
+        the student logits. The teacher distribution stays transient -- never transported or
+        CPU-copied -- so co-location, not top-k, is what bounds transport; chunking bounds the KL's
+        own softmax scratch downstream (``vocab_parallel_full_kl_with_chunking``).
+
+        Returns a nested (bsz, student_seqlen, vocab/tp) tensor for ``batch["teacher_log_probs"]``.
+        """
+        from verl.trainer.distillation.megatron.losses import vocab_parallel_log_softmax
+        from verl.workers.utils.padding import response_from_nested, response_to_sequence_nested
+
+        # First-landing constraints: a nested full-model teacher forward can only run on a single
+        # pipeline stage, and the response-alignment below assumes the un-CP-split full sequence.
+        assert (
+            mpu.get_pipeline_model_parallel_world_size() == 1
+        ), "SDPO co-located full-KL requires pipeline_model_parallel_size=1."
+        assert (
+            mpu.get_context_parallel_world_size() == 1
+        ), "SDPO co-located full-KL requires context_parallel_size=1 (first landing)."
+
+        response_mask = batch["response_mask"]
+        prompts = batch["prompts"]
+        # teacher_input_ids is already the engine's nested [teacher_prompt | response] sequence
+        # (the trainer nested it via left_right_2_no_padding), so it micro-batches exactly like the
+        # student's own input_ids; position_ids are derived internally from its offsets.
+        teacher_input_ids = batch["teacher_input_ids"]
+        teacher_temperature = verl_F.expand_as_nested(per_sample_temperature, teacher_input_ids)
+
+        def _teacher_logits_processor(logits, label, temperature, **_ignored):
+            # Match the student logits processor: divide by (per-token) temperature before softmax.
+            # Guard non-positive (padding) temperatures like the student path does; those positions
+            # are dropped by postprocess/response_from_nested anyway, but avoid inf mid-computation.
+            temperature = temperature.to(logits.dtype).clamp_min(1e-8)
+            logits = logits / temperature.unsqueeze(-1)
+            return {"teacher_log_probs": vocab_parallel_log_softmax(logits).float()}
+
+        # teacher_use_base_model: disable the LoRA adapter for the teacher forward so the teacher is
+        # the frozen base weights (a fixed reference), while the student keeps its trainable adapter
+        # -- SDPO's mix_coef->0 trust-region limit. Mirrors the old worker path's no_lora_adapter
+        # (engine_workers.disable_adapter()); a no-op when the run has no LoRA / the flag is False.
+        from contextlib import nullcontext
+
+        adapter_ctx = self.disable_adapter() if teacher_use_base_model else nullcontext()
+        with torch.no_grad(), adapter_ctx:
+            teacher_out = forward_fn(
+                model,
+                teacher_input_ids,
+                multi_modal_inputs,
+                logits_processor=_teacher_logits_processor,
+                logits_processor_args={
+                    "label": teacher_input_ids,  # unused by the teacher processor; arg parity only
+                    "temperature": teacher_temperature,
+                },
+                vision_model=hasattr(self.model_config.hf_config, "vision_config"),
+                pad_token_id=self.model_config.tokenizer.pad_token_id,
+                data_format=data_format,
+                mtp_enable_train=False,
+                local_cp_size=None,
+                forced_max_seqlen=None,
+            )
+        teacher_log_probs_full = teacher_out["teacher_log_probs"]  # nested (bsz, teacher_seqlen, V/tp)
+
+        # Remap the teacher's response-window distribution onto the student's [prompt | response]
+        # layout (inverse of response_from_nested); the full-KL processor CP-splits it downstream.
+        resp_lp = response_from_nested(teacher_log_probs_full, response_mask)  # (bsz, resp_len, V/tp)
+        resp_lp = resp_lp.to_padded_tensor(0.0)
+        prompt_lens = prompts.offsets().diff()
+        response_lens = response_mask.offsets().diff() if response_mask.is_nested else response_mask.sum(dim=-1)
+        return response_to_sequence_nested(resp_lp, prompt_lens, response_lens, fill_value=0.0)
+
     def _lm_head_logits_processor(
         self,
         logits,
@@ -911,8 +990,8 @@ class MegatronEngineWithLMHead(MegatronEngine):
         calculate_sum_pi_squared: bool,
         calculate_entropy: bool,
         distillation_use_topk: bool,
+        distillation_use_full_kl: bool,
         distillation_only: bool,
-        compute_self_teacher_topk: bool,
         logits_processor_func: Callable,
         batch: TensorDict,
         data_format: str,
@@ -947,24 +1026,13 @@ class MegatronEngineWithLMHead(MegatronEngine):
         else:
             logits_bak = logits
 
-        # SDPO self-teacher forward: emit the model's OWN global top-k (teacher_logprobs / teacher_ids)
-        # from the vocab-parallel logits, the transport the SDPO loss consumes on the next (student)
-        # forward. Independent of logits_processor_func (the infer path passes it as None), and does
-        # not consume teacher_ids (unlike the distillation_use_topk branch, which gathers at them).
-        if compute_self_teacher_topk:
-            from verl.utils.megatron.tensor_parallel import vocab_parallel_topk_log_probs
-
-            k = tu.get_non_tensor_data(data=batch, key="self_teacher_topk_k", default=None)
-            assert k is not None, "self_teacher_topk_k must be set for the SDPO self-teacher forward"
-            teacher_topk_log_probs, teacher_topk_ids = vocab_parallel_topk_log_probs(logits_bak, k)
-            # (bsz, seqlen/cp_size, k) — sliced to response positions downstream like log_probs.
-            ret["teacher_logprobs"] = teacher_topk_log_probs
-            ret["teacher_ids"] = teacher_topk_ids
-
-        # logits_processor_func return tensors with shape (1, total_nnz/cp_size)
-        if distillation_use_topk:
+        # logits_processor_func returns tensors with shape (1, total_nnz/cp_size). Both the OPD
+        # top-k KL and the SDPO exact full-vocab KL run here on the student logits; the SDPO path
+        # additionally reads batch["teacher_log_probs"], populated by the co-located self-teacher
+        # forward (see _sdpo_teacher_full_log_probs), rather than a transported top-k.
+        if distillation_use_topk or distillation_use_full_kl:
             ret.update(logits_processor_func(student_logits=logits_bak, data=batch, data_format=data_format))
-        if not distillation_only and not compute_self_teacher_topk:
+        if not distillation_only:
             ret["log_probs"] = vocab_parallel_log_probs_from_logits(logits_bak, label)
 
         return ret
@@ -990,8 +1058,9 @@ class MegatronEngineWithLMHead(MegatronEngine):
         calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
+        distillation_use_full_kl = tu.get_non_tensor_data(batch, key="distillation_use_full_kl", default=False)
+        sdpo_teacher_use_base_model = tu.get_non_tensor_data(batch, key="sdpo_teacher_use_base_model", default=False)
         distillation_only = tu.get_non_tensor_data(batch, key="distillation_only", default=False)
-        compute_self_teacher_topk = tu.get_non_tensor_data(batch, key="compute_self_teacher_topk", default=False)
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
@@ -1072,19 +1141,34 @@ class MegatronEngineWithLMHead(MegatronEngine):
 
             temperature = temperature.to(torch.float32)
             assert temperature.shape[0] == input_ids.shape[0]
+            per_sample_temperature = temperature  # (bsz,), pre-expansion; reused for the SDPO teacher
             temperature = verl_F.expand_as_nested(temperature, input_ids)  # (bsz, j1)
             from verl.models.mcore import get_mcore_engine_forward_fn
 
             forward_fn = get_mcore_engine_forward_fn(self.model_config.hf_config)
             data_format = "thd" if self.engine_config.use_remove_padding else "bshd"
 
+            # SDPO: co-located self-teacher forward. Score the reprompted sequence no-grad with the
+            # same weights and stash its full-vocab log-softmax (remapped to the student's layout)
+            # for the full-KL logits processor below -- kept transient, never CPU-copied/transported.
+            if distillation_use_full_kl:
+                batch["teacher_log_probs"] = self._sdpo_teacher_full_log_probs(
+                    model=model,
+                    batch=batch,
+                    forward_fn=forward_fn,
+                    per_sample_temperature=per_sample_temperature,
+                    multi_modal_inputs=multi_modal_inputs,
+                    data_format=data_format,
+                    teacher_use_base_model=sdpo_teacher_use_base_model,
+                )
+
             logits_processor = partial(
                 self._lm_head_logits_processor,
                 calculate_sum_pi_squared=calculate_sum_pi_squared,
                 calculate_entropy=calculate_entropy,
                 distillation_use_topk=distillation_use_topk,
+                distillation_use_full_kl=distillation_use_full_kl,
                 distillation_only=distillation_only,
-                compute_self_teacher_topk=compute_self_teacher_topk,
                 logits_processor_func=logits_processor_func,
                 batch=batch,
                 data_format=data_format,

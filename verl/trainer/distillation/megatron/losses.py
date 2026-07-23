@@ -261,6 +261,107 @@ class _VocabParallelKLDivergence(torch.autograd.Function):
         return grad_input, None, None, None
 
 
+class _VocabParallelFullKLDivergence(torch.autograd.Function):
+    """Exact full-vocabulary KL between a student (grad) and a detached teacher, over
+    tensor-parallel-sharded logits. Replaces SDPO's top-k tail-bucket estimate.
+
+    Both distributions are normalized over the FULL vocabulary via the TP all-reduce inside
+    ``vocab_parallel_log_softmax`` -- there is no top-k truncation and no tail bucket. The
+    teacher log-probs are supplied already-normalized (computed no-grad in the co-located
+    teacher forward), so only the student side carries gradient.
+
+    ``alpha`` selects the direction (p = student softmax, q = teacher softmax):
+      - ``alpha == 0.0``: forward KL  ``KL(teacher || student) = sum_v q_v (log q_v - log p_v)``
+      - ``alpha == 1.0``: reverse KL  ``KL(student || teacher) = sum_v p_v (log p_v - log q_v)``
+
+    Gradient w.r.t. the student logit z_j (derived through the softmax Jacobian; the
+    ``sum_v p_v (delta_vj - p_j)`` term vanishes because ``sum_v p_v = 1``):
+      - forward: ``dL/dz_j = p_j - q_j``
+      - reverse: ``dL/dz_j = p_j (log p_j - log q_j - KL)``
+    Both are local to the TP shard, so the backward adds no collective (the reverse scale is the
+    per-token KL already all-reduced in the forward).
+
+    ``save_for_backward`` retains the full-width fp32 ``p, q`` (and ``log_p, log_q`` for reverse)
+    for the chunk it runs on, so chunking (see ``vocab_parallel_full_kl_with_chunking``) bounds
+    only the live softmax scratch, not the saved set. A recompute variant (save logits, recompute
+    in backward, +1 all-reduce/chunk) could cut that later; the small-model runs don't need it.
+    """
+
+    @staticmethod
+    def forward(ctx, vp_student_logits: torch.Tensor, vp_teacher_log_probs: torch.Tensor, alpha: float):
+        from megatron.core.parallel_state import get_tensor_model_parallel_group
+
+        if alpha not in (0.0, 1.0):
+            raise ValueError(f"_VocabParallelFullKLDivergence supports alpha in {{0.0, 1.0}}, got {alpha}.")
+        tp_group = get_tensor_model_parallel_group()
+
+        # Full-vocab-normalized student log-probs (TP all-reduce of max + sum-exp inside).
+        log_p = vocab_parallel_log_softmax(vp_student_logits).float()
+        p = log_p.exp()
+        log_q = vp_teacher_log_probs.float()
+        q = log_q.exp()
+
+        if alpha == 0.0:
+            per_token_kl = torch.sum(q * (log_q - log_p), dim=-1)
+        else:
+            per_token_kl = torch.sum(p * (log_p - log_q), dim=-1)
+        # Local shard partial sums -> full-vocab per-token KL.
+        torch.distributed.all_reduce(per_token_kl, op=torch.distributed.ReduceOp.SUM, group=tp_group)
+
+        ctx.alpha = alpha
+        ctx.input_dtype = vp_student_logits.dtype
+        if alpha == 0.0:
+            ctx.save_for_backward(p, q)
+        else:
+            ctx.save_for_backward(p, log_p, log_q, per_token_kl)
+        return per_token_kl
+
+    @staticmethod
+    def backward(ctx, grad_kl: torch.Tensor):
+        if ctx.alpha == 0.0:
+            p, q = ctx.saved_tensors
+            grad_student = grad_kl.unsqueeze(-1) * (p - q)
+        else:
+            p, log_p, log_q, per_token_kl = ctx.saved_tensors
+            grad_student = grad_kl.unsqueeze(-1) * p * (log_p - log_q - per_token_kl.unsqueeze(-1))
+        return grad_student.to(ctx.input_dtype), None, None
+
+
+def vocab_parallel_full_kl_with_chunking(
+    student_logits: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    alpha: float,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Chunked full-vocab KL over the sequence dimension, mirroring
+    ``verl.utils.megatron.tensor_parallel.vocab_parallel_entropy_with_chunking``.
+
+    Each seq chunk still holds the full local vocab shard, so its normalizer is a single
+    ``vocab_parallel_log_softmax`` -- no two-pass online logsumexp. This bounds the transient
+    softmax scratch to one chunk while autograd routes each chunk's grad back into the matching
+    student-logit slice.
+
+    Args:
+        student_logits: (B, S, V/tp) local vocab shard, requires grad.
+        teacher_log_probs: (B, S, V/tp) local shard of the teacher's full-vocab log-softmax
+            (detached).
+        alpha: 0.0 (forward KL) or 1.0 (reverse KL).
+        chunk_size: number of sequence positions per chunk.
+
+    Returns:
+        (B, S) per-token full-vocab KL (fp32).
+    """
+    B, S = student_logits.shape[:2]
+    out = torch.zeros((B, S), device=student_logits.device, dtype=torch.float32)
+    for i in range(0, S, chunk_size):
+        out[:, i : i + chunk_size] = _VocabParallelFullKLDivergence.apply(
+            student_logits[:, i : i + chunk_size, :],
+            teacher_log_probs[:, i : i + chunk_size, :],
+            alpha,
+        )
+    return out
+
+
 def compute_forward_kl_topk(
     student_logits: torch.Tensor,
     teacher_topk_log_probs: torch.Tensor,
@@ -324,3 +425,51 @@ def compute_forward_kl_topk(
         "overlap_count": overlap_count,
         "overlap_token_advantage": overlap_token_advantage,
     }
+
+
+def compute_self_distill_full_kl(
+    student_logits: torch.Tensor,
+    teacher_log_probs: torch.Tensor,
+    config: "DistillationConfig",
+    data_format: str,
+) -> dict[str, torch.Tensor]:
+    """Exact full-vocab SDPO KL from the co-located teacher's full log-softmax.
+
+    Unlike the top-k path, ``teacher_log_probs`` is the teacher's FULL-vocab log-softmax --
+    a nested (bsz, seqlen, vocab_size/tp_size) local shard already remapped to the student's
+    sequence layout and produced no-grad in the same update micro-batch -- not a top-k slice.
+    ``config.alpha`` selects forward (0.0) or reverse (1.0) KL; the divergence is computed
+    chunk-by-chunk over the sequence to bound the softmax scratch (see
+    ``vocab_parallel_full_kl_with_chunking``). No mass/overlap tensors: the KL is exact.
+
+    Args:
+        student_logits: (bsz, seqlen/cp_size, vocab_size/tp_size), requires grad.
+        teacher_log_probs: nested (bsz, seqlen, vocab_size/tp_size) teacher full log-softmax.
+        config: the SelfDistillationConfig (carries ``alpha`` and ``kl_chunk_size``).
+        data_format: "thd" or "bshd".
+
+    Returns:
+        - distillation_losses: (bsz, seqlen/cp_size)
+    """
+    assert teacher_log_probs.is_nested
+
+    # CP-split the teacher shard to the student's (bsz, seqlen/cp_size) layout, exactly as
+    # compute_forward_kl_topk splits the teacher top-k tensors.
+    if data_format == "thd":
+        teacher_log_probs_cp_split, *_ = preprocess_thd_engine(teacher_log_probs, pre_process=True)
+    else:
+        from megatron.core.parallel_state import get_context_parallel_world_size
+
+        cp_size = get_context_parallel_world_size()
+        forced_max_seqlen = student_logits.shape[1] * cp_size
+        teacher_log_probs_cp_split, *_ = preprocess_bshd_engine(
+            teacher_log_probs, pre_process=True, forced_max_seqlen=forced_max_seqlen
+        )
+    assert teacher_log_probs_cp_split.shape[:2] == student_logits.shape[:2]
+
+    alpha = float(config.alpha)
+    chunk_size = getattr(config, "kl_chunk_size", 1024)
+    distillation_losses = vocab_parallel_full_kl_with_chunking(
+        student_logits, teacher_log_probs_cp_split, alpha, chunk_size
+    )
+    return {"distillation_losses": distillation_losses}

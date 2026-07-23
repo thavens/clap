@@ -52,19 +52,23 @@ class DistillationLossSettings(BaseConfig):
         names (str | list[str]): Name(s) to register the distillation loss function under.
         use_topk (bool): Whether the loss function uses top-k log probabilities.
         use_estimator (bool): Whether the loss function uses single-sample KL estimators.
+        use_full_kl (bool): Whether the loss function uses the exact full-vocab KL (SDPO,
+            computed against the co-located teacher forward's full log-softmax).
     """
 
     names: str | list[str] = field(default_factory=list)
     use_topk: bool = False
     use_estimator: bool = False
+    use_full_kl: bool = False
 
     _mutable_fields = {"names"}
 
     def __post_init__(self):
         self.names = [self.names] if isinstance(self.names, str) else self.names
-        if sum([self.use_topk, self.use_estimator]) != 1:
+        if sum([self.use_topk, self.use_estimator, self.use_full_kl]) != 1:
             raise ValueError(
-                f"Expected only one of use_estimator, use_topk, but got {self.use_estimator=}, {self.use_topk=}."
+                "Expected exactly one of use_estimator, use_topk, use_full_kl, but got "
+                f"{self.use_estimator=}, {self.use_topk=}, {self.use_full_kl=}."
             )
 
 
@@ -127,33 +131,53 @@ def compute_topk_loss(
     student_logits: torch.Tensor,
     data_format: str,
 ) -> torch.Tensor:
-    """Compute the topk loss in logit processor.
+    """Compute the distillation loss in the logits processor (student forward).
 
-    Returns:
-    - distillation_losses: (bsz, seqlen/cp_size)
-    - student_mass: (bsz, seqlen/cp_size)
-    - teacher_mass: (bsz, seqlen/cp_size)
+    Two families share this entry:
+    - OPD top-k forward KL (``use_topk``): consumes the served teacher's transported top-k
+      (``teacher_logprobs`` / ``teacher_ids``).
+    - SDPO exact full-vocab KL (``use_full_kl``): consumes the co-located teacher's full
+      log-softmax (``teacher_log_probs``); ``distillation_config.alpha`` picks forward (0.0) vs
+      reverse (1.0) KL. Megatron only.
+
+    Returns a dict of (bsz, seqlen/cp_size) tensors (at least ``distillation_losses``).
     """
-    match config.strategy:
-        # VeOmni uses FSDP2 internally, so its loss computation is identical to FSDP.
-        case "fsdp" | "veomni":
-            import verl.trainer.distillation.fsdp.losses as fsdp_losses
+    if distillation_config.distillation_loss.loss_settings.use_full_kl:
+        # SDPO: exact full-vocab KL against the co-located teacher's full distribution.
+        if config.strategy != "megatron":
+            raise NotImplementedError(
+                f"SDPO full-vocab KL is implemented on the Megatron path only, got {config.strategy=}."
+            )
+        import verl.trainer.distillation.megatron.losses as megatron_losses
 
-            distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
-        case "megatron":
-            import verl.trainer.distillation.megatron.losses as megatron_losses
+        outputs = megatron_losses.compute_self_distill_full_kl(
+            student_logits=student_logits,
+            teacher_log_probs=data["teacher_log_probs"],
+            config=distillation_config,
+            data_format=data_format,
+        )
+    else:
+        # OPD top-k forward KL (mass-covering) from the served teacher's transported top-k.
+        match config.strategy:
+            # VeOmni uses FSDP2 internally, so its loss computation is identical to FSDP.
+            case "fsdp" | "veomni":
+                import verl.trainer.distillation.fsdp.losses as fsdp_losses
 
-            distillation_loss_fn = megatron_losses.compute_forward_kl_topk
-        case _:
-            raise NotImplementedError(f"Unsupported strategy: {config.strategy=}")
+                distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
+            case "megatron":
+                import verl.trainer.distillation.megatron.losses as megatron_losses
 
-    outputs = distillation_loss_fn(
-        student_logits=student_logits,
-        teacher_topk_log_probs=data["teacher_logprobs"],
-        teacher_topk_ids=data["teacher_ids"],
-        config=distillation_config,
-        data_format=data_format,
-    )
+                distillation_loss_fn = megatron_losses.compute_forward_kl_topk
+            case _:
+                raise NotImplementedError(f"Unsupported strategy: {config.strategy=}")
+
+        outputs = distillation_loss_fn(
+            student_logits=student_logits,
+            teacher_topk_log_probs=data["teacher_logprobs"],
+            teacher_topk_ids=data["teacher_ids"],
+            config=distillation_config,
+            data_format=data_format,
+        )
 
     expected_shape = student_logits.shape[:2]
     for k, v in outputs.items():
@@ -307,6 +331,28 @@ def distillation_loss(
         # Directly backpropagate distillation loss as a supervised loss, as in https://arxiv.org/abs/2306.13649.
         if response_mask.is_nested:
             response_mask = response_mask.to_padded_tensor(False)
+
+        # SDPO is_clip: reweight the per-token distill loss by a clamped importance ratio
+        # exp(student_logp - old_logp), correcting for the rollout being slightly off-policy and
+        # capping how much any one token can dominate the update. The ratio is DETACHED -- it is
+        # a weight, not part of the divergence gradient -- matching the reference SDPO
+        # (compute_self_distillation_loss). `is_clip` lives on the SelfDistillationConfig.
+        is_clip = getattr(distillation_config, "is_clip", None)
+        if is_clip is not None:
+            student_logp = no_padding_2_padding(model_output["log_probs"], data)
+            old_logp = data["old_log_probs"]
+            if old_logp.is_nested:
+                old_logp = old_logp.to_padded_tensor(0.0)
+            assert student_logp.shape == old_logp.shape == distillation_losses.shape
+            negative_approx_kl = (student_logp - old_logp).detach().clamp(min=-20.0, max=20.0)
+            ratio = torch.exp(negative_approx_kl).clamp(max=is_clip)
+            distillation_losses = distillation_losses * ratio
+            valid_ratio = ratio[response_mask.bool()]
+            distillation_metrics["sdpo/is_ratio_mean"] = valid_ratio.mean().item() if valid_ratio.numel() else 0.0
+            distillation_metrics["sdpo/is_clip_frac"] = (
+                (valid_ratio >= is_clip).float().mean().item() if valid_ratio.numel() else 0.0
+            )
+
         distillation_loss = agg_loss(
             loss_mat=distillation_losses,
             loss_mask=response_mask,
@@ -382,61 +428,39 @@ def compute_forward_kl_topk(
     return distillation_losses, distillation_metrics
 
 
-@register_distillation_loss(DistillationLossSettings(names=["self_distill_jsd_topk"], use_topk=True))  # type: ignore[arg-type]
-def compute_self_distill_jsd_topk(
+@register_distillation_loss(DistillationLossSettings(names=["self_distill_full_kl"], use_full_kl=True))  # type: ignore[arg-type]
+def compute_self_distill_full_kl_metric(
     config: ActorConfig,
     distillation_config: DistillationConfig,
     model_output: dict,
     data: TensorDict,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """SDPO self-distillation top-k loss (metric phase).
+    """SDPO exact full-vocab KL (metric phase).
 
-    Reuses the vocab-parallel forward-KL processor outputs (``distillation_losses`` =
-    truncated forward KL over the teacher's top-k, plus ``student_mass`` / ``teacher_mass``)
-    and reconstructs SDPO's tail-bucketed or renormalized forward KL from them via
-    ``forward_kl_from_masses`` -- no student log-probs at teacher ids are needed here.
+    The per-token KL was already computed in the logits processor
+    (``compute_self_distill_full_kl``) against the co-located teacher's full log-softmax, for
+    the direction chosen by ``distillation_config.alpha`` (0.0 forward, 1.0 reverse). Here we
+    only align it to the response and aggregate -- there are no mass/overlap diagnostics because
+    the KL is exact, not a top-k truncation.
 
     ``distillation_config`` is a ``SelfDistillationConfig`` standing in for the distillation
     config; see ``verl/workers/config/sdpo.py`` for that contract.
-
-    Only ``alpha == 0`` (forward KL) is supported on this reuse path. ``alpha > 0``
-    (reverse KL / JSD) additionally needs the student's own top-k support and is deferred.
 
     Returns:
     - distillation_losses: (bsz, resp_len)
     - distillation_metrics
     """
-    from verl.trainer.distillation.sdpo_math import forward_kl_from_masses
-
-    alpha, add_tail = distillation_config.alpha, distillation_config.add_tail
-    if alpha != 0.0:
-        raise NotImplementedError(
-            "SDPO alpha > 0 (reverse KL / JSD) needs the student's own top-k support and is not yet "
-            f"implemented on the top-k logits-processor path; only alpha=0 (forward KL) is supported (got {alpha}). "
-            "Set sdpo.alpha=0.0."
-        )
-
-    truncated_fkl = no_padding_2_padding(model_output["distillation_losses"], data)
-    student_mass = no_padding_2_padding(model_output["student_mass"], data)
-    teacher_mass = no_padding_2_padding(model_output["teacher_mass"], data)
+    distillation_losses = no_padding_2_padding(model_output["distillation_losses"], data)
     if data["response_mask"].is_nested:
         response_mask_bool = data["response_mask"].bool().to_padded_tensor(False)
     else:
         response_mask_bool = data["response_mask"].bool()
-    assert truncated_fkl.shape == student_mass.shape == teacher_mass.shape == response_mask_bool.shape
+    assert distillation_losses.shape == response_mask_bool.shape
 
-    distillation_losses = forward_kl_from_masses(truncated_fkl, student_mass, teacher_mass, add_tail)
-    # A proper forward KL is >= 0; truncation of the top-k support can make the raw value
-    # slightly negative, so clamp (matches compute_forward_kl_topk).
+    # A proper KL is >= 0; the exact full-vocab value can dip slightly negative only from fp
+    # rounding, so clamp for safety.
     distillation_losses = distillation_losses.clamp_min(0.0)
-
-    valid_student_mass = student_mass[response_mask_bool]
-    valid_teacher_mass = teacher_mass[response_mask_bool]
-    distillation_metrics = {
-        "sdpo/student_mass": valid_student_mass.mean().item() if valid_student_mass.numel() else 0.0,
-        "sdpo/teacher_mass": valid_teacher_mass.mean().item() if valid_teacher_mass.numel() else 0.0,
-    }
-    return distillation_losses, distillation_metrics
+    return distillation_losses, {}
 
 
 @register_distillation_loss(

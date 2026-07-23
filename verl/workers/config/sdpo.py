@@ -22,12 +22,12 @@ teacher-forced over the student's own tokens -- and the loss is a per-token
 divergence between the student and ``stopgrad(teacher)``.
 
 This port is built on top of verl's existing on-policy-distillation (OPD)
-subsystem: the divergence is expressed as a registered top-k distillation loss
-(``verl.trainer.distillation.losses``) and reuses the ``teacher_logprobs`` /
-``teacher_ids`` transport. Only the teacher *source* is new -- instead of a
-separate served model scoring the same prompt, an in-trainer forward of the
-same weights scores the reprompted (feedback-augmented) sequence. See
-``verl/trainer/ppo/sdpo_reprompt.py`` for reprompt construction.
+subsystem: the divergence is a registered distillation loss
+(``verl.trainer.distillation.losses``). Unlike OPD's served teacher, the SDPO
+self-teacher is an in-trainer forward of the same weights over the reprompted
+(feedback-augmented) sequence, co-located in the update micro-batch so the exact
+full-vocab KL is computed against its full log-softmax with no top-k transport.
+See ``verl/trainer/ppo/sdpo_reprompt.py`` for reprompt construction.
 
 ``SelfDistillationConfig`` deliberately holds a nested
 ``distillation_loss: DistillationLossConfig`` so it can be handed to
@@ -70,18 +70,20 @@ class SelfDistillationConfig(BaseConfig):
         enabled (bool):
             Whether SDPO self-distillation is enabled.
         alpha (float):
-            Divergence interpolation. ``0.0`` -> forward KL ``KL(teacher||student)``
-            (the paper's headline method; maps onto verl's existing
-            ``forward_kl_topk`` kernel); ``1.0`` -> reverse KL
-            ``KL(student||teacher)``; in between -> generalized Jensen-Shannon.
-        add_tail (bool):
-            Whether to append a tail bucket ``log(1 - sum(top-k p))`` so the
-            truncated top-k distributions are proper distributions. When False,
-            the top-k log-probs are renormalized instead.
+            Divergence direction. ``0.0`` -> forward KL ``KL(teacher||student)``
+            (mass-covering); ``1.0`` -> reverse KL ``KL(student||teacher)``
+            (mode-seeking). Computed exactly over the full vocabulary against the
+            co-located teacher's full log-softmax (Megatron only). Intermediate
+            values (generalized Jensen-Shannon) are not implemented -- the full-KL
+            kernel only forms the two endpoints.
+        kl_chunk_size (int):
+            Sequence-chunk size for the full-vocab KL (mirrors chunked softmax) so
+            the per-chunk softmax scratch stays bounded. Must be > 0.
         is_clip (float, optional):
-            NOT IMPLEMENTED -- must be left ``None``. Reserved for clipping the
-            importance-sampling ratio ``exp(logp - old_logp)`` at this value and
-            reweighting the per-token loss by it.
+            Cap on the per-token distillation importance ratio
+            ``exp(logp - old_logp).clamp(max=is_clip)``, which reweights the
+            per-token loss (detached weight). ``None`` disables it; a set value
+            must be ``> 1``. Implemented in ``verl/trainer/distillation/losses.py``.
         success_reward_threshold (float):
             A rollout counts as a successful "solution" demonstration for its
             sibling group when its scalar reward is ``>=`` this. CLAP's reward is
@@ -121,7 +123,7 @@ class SelfDistillationConfig(BaseConfig):
             trust-region mix coefficient for ``teacher_regularization``.
         distillation_loss (DistillationLossConfig):
             Loss-side config, reused verbatim from the OPD subsystem. Set
-            ``loss_mode='self_distill_jsd_topk'``. ``use_task_rewards`` /
+            ``loss_mode='self_distill_full_kl'``. ``use_task_rewards`` /
             ``task_loss_coef`` / ``distillation_loss_coef`` / ``use_policy_gradient`` control GRPO
             composition (see module docstring).
     """
@@ -132,8 +134,8 @@ class SelfDistillationConfig(BaseConfig):
 
     # divergence
     alpha: float = 0.0
-    add_tail: bool = True
     is_clip: float | None = None
+    kl_chunk_size: int = 1024
 
     # feedback / reprompt selection
     success_reward_threshold: float = 1.0
@@ -160,18 +162,20 @@ class SelfDistillationConfig(BaseConfig):
         if not self.enabled:
             return
 
-        if not 0.0 <= self.alpha <= 1.0:
-            raise ValueError(f"SDPO alpha must be in [0, 1], got {self.alpha}.")
+        # Only forward (0.0) and reverse (1.0) KL are implemented; intermediate generalized JSD
+        # would need the per-id student/teacher mixture, which the full-KL kernel does not form.
+        if self.alpha not in (0.0, 1.0):
+            raise ValueError(f"SDPO alpha must be 0.0 (forward KL) or 1.0 (reverse KL), got {self.alpha}.")
 
-        topk = self.distillation_loss.topk
-        if topk is None or topk <= 0:
-            raise ValueError(f"SDPO requires distillation_loss.topk > 0, got {topk}.")
+        if self.kl_chunk_size <= 0:
+            raise ValueError(f"SDPO kl_chunk_size must be > 0, got {self.kl_chunk_size}.")
 
-        if not self.distillation_loss.loss_settings.use_topk:
+        if not self.distillation_loss.loss_settings.use_full_kl:
             raise ValueError(
-                "SDPO requires a top-k distillation loss "
-                f"(loss_settings.use_topk=True), but loss_mode="
-                f"{self.distillation_loss.loss_mode!r} is not top-k."
+                "SDPO requires the exact full-vocab KL loss "
+                f"(loss_settings.use_full_kl=True), but loss_mode="
+                f"{self.distillation_loss.loss_mode!r} is not the full-KL loss "
+                "(set loss_mode='self_distill_full_kl')."
             )
 
         if self.reprompt_truncation not in ("right", "left", "error"):
@@ -182,13 +186,14 @@ class SelfDistillationConfig(BaseConfig):
         if self.max_reprompt_len <= 0:
             raise ValueError(f"max_reprompt_len must be > 0, got {self.max_reprompt_len}.")
 
+        # is_clip: caps the per-token distillation importance ratio exp(logp - old_logp).
+        # None disables it; a set value must be > 1 (a cap <= 1 would clamp every on/under-policy
+        # token and gut the loss). Implemented in verl/trainer/distillation/losses.py.
+        if self.is_clip is not None and self.is_clip <= 1.0:
+            raise ValueError(f"sdpo.is_clip must be > 1.0 when set (a per-token IS-ratio cap), got {self.is_clip}.")
+
         # Declared-but-unimplemented knobs. Reject them rather than accepting a value nothing
         # reads -- a silently ignored regularization setting looks like it trained regularized.
-        if self.is_clip is not None:
-            raise NotImplementedError(
-                f"sdpo.is_clip is declared but not implemented (got {self.is_clip}); leave it null."
-            )
-
         if self.teacher_regularization != "none" or self.teacher_update_rate != 0.0:
             raise NotImplementedError(
                 "sdpo.teacher_regularization / sdpo.teacher_update_rate are declared but not "

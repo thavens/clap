@@ -52,10 +52,30 @@ def test_score_response(response, expected_score, expected_fraction):
     assert fraction == pytest.approx(expected_fraction)
 
 
+@pytest.mark.parametrize(
+    ("response", "expected_score"),
+    [
+        # Reasoning is dropped: only the post-</think> answer is scored, so period-laden thinking
+        # cannot swamp the signal.
+        ("<think>First. Second. Third.</think>All good! Yes!", 1.0),
+        ("<think>Lots. Of. Periods.</think>Half good! Half bad.", 0.5),
+        # Answer is empty / whitespace after reasoning -> no endings -> 0.
+        ("<think>Reasoning! Reasoning!</think>", 0.0),
+        # Unclosed reasoning (still thinking at the length limit) -> no answer -> 0.
+        ("<think>Still reasoning! Never stopped!", 0.0),
+        # No reasoning markers -> whole thing scored (no-op when thinking is disabled).
+        ("Plain answer!", 1.0),
+    ],
+)
+def test_score_response_strips_reasoning(response, expected_score):
+    score, _ = exclaim.score_response(response)
+    assert score == pytest.approx(expected_score)
+
+
 @pytest.mark.parametrize("response,score", [("Good!", 1.0), ("Bad.", 0.0), ("Mixed! Bad?", 0.5)])
 def test_feedback_is_fixed(response, score):
     assert exclaim.compose_feedback(response, score) == (
-        "please write your response such that all sentences end in exclamations."
+        "please write your final answer such that all sentences end in exclamations."
     )
 
 
@@ -69,7 +89,7 @@ def test_compute_score_shape_matches_the_reward_contract():
     assert set(result) == {"score", "exclaim_fraction", "sentence_endings", "feedback"}
     assert result["score"] == 0.0
     assert result["sentence_endings"] == 0.0
-    assert result["feedback"] == "please write your response such that all sentences end in exclamations."
+    assert result["feedback"] == "please write your final answer such that all sentences end in exclamations."
 
 
 def test_compute_score_ignores_data_source_and_ground_truth():

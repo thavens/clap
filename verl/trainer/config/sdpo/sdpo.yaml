@@ -4,12 +4,12 @@ _target_: verl.workers.config.SelfDistillationConfig
 # Whether to enable SDPO self-distillation.
 enabled: false
 
-# Divergence interpolation: 0.0 forward KL (teacher||student), 1.0 reverse KL, in between JSD.
-# Only alpha=0 is supported on the Megatron top-k reuse path; alpha>0 is deferred.
+# Divergence direction: 0.0 forward KL (teacher||student), 1.0 reverse KL. Both are computed
+# exactly over the full vocabulary against the co-located teacher; intermediate JSD is deferred.
 alpha: 0.0
 
-# Append a tail bucket so truncated top-k distributions are proper (vs. renormalizing).
-add_tail: true
+# Sequence-chunk size for the full-vocab KL (chunked like softmax) to bound the softmax scratch.
+kl_chunk_size: 1024
 
 # NOT IMPLEMENTED, must stay null (setting it raises). Reserved for an importance-sampling
 # clip on exp(logp - old_logp).
@@ -50,11 +50,8 @@ distillation_loss:
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.workers.config.DistillationLossConfig
 
-  # SDPO top-k self-distillation divergence.
-  loss_mode: self_distill_jsd_topk
-
-  # Number of student top-k candidates retained per token.
-  topk: 100
+  # SDPO exact full-vocab self-distillation KL.
+  loss_mode: self_distill_full_kl
 
   # Pure SDPO when false; set true to combine task-reward PG and SDPO losses.
   use_task_rewards: false

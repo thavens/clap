@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Exclamation-sentence-endings task | SDPO | Qwen3.5-4B-Base | LoRA | Megatron
+# Exclamation-sentence-endings task | SDPO | Qwen3.5-4B (instruct, reasoning off) | LoRA | Megatron
 #
 # A free, deterministic end-to-end exercise of the SDPO loop. The policy keeps the InjecAgent
 # CLAP attacker prompts, but the reward is swapped for a local graded predicate: the fraction of
@@ -22,6 +22,14 @@ set -xeuo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
+
+# The exclaim task only moves the policy if it can follow the scorer's in-context feedback. The
+# 4B *base* model follows that feedback too weakly to be taught by pure-SDPO distillation, so this
+# task uses the instruct model. Reasoning stays disabled via the base launcher's
+# enable_thinking=False -- the exclaim reward scores only the post-</think> answer, so thinking
+# would only flood it with period-ended sentences. Callers that export MODEL_PATH (e.g. the sky
+# stages, which point at the pre-downloaded local dir) still win.
+export MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.5-4B}"
 
 # Delegates to the SDPO launcher (which delegates to the Dr-GRPO one), so model / LoRA /
 # Megatron / rollout settings stay in one place and this file is only the task delta.

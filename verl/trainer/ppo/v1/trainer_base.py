@@ -93,7 +93,7 @@ from verl.workers.config import CriticConfig, DistillationConfig, SelfDistillati
 from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker, TrainingWorkerConfig
 from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
 from verl.workers.utils.losses import value_loss
-from verl.workers.utils.padding import response_from_nested, response_to_nested, response_to_sequence_nested
+from verl.workers.utils.padding import response_from_nested, response_to_nested
 
 
 def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
@@ -288,8 +288,8 @@ class PPOTrainer(ABC):
             self.distillation_config = None
 
         # SDPO self-distillation: the teacher is the same policy scoring a feedback-augmented
-        # prompt via an in-trainer forward (see _compute_self_teacher_topk). It reuses the OPD
-        # top-k transport/loss but must NOT allocate a served-teacher pool, so it is gated
+        # prompt via an in-trainer forward (see _build_self_teacher_sequence + the co-located
+        # teacher forward in the engine). It must NOT allocate a served-teacher pool, so it is gated
         # separately from use_teacher_policy.
         self.sdpo_enabled = need_self_distillation(self.config)
         if self.sdpo_enabled and self.use_teacher_policy:
@@ -519,10 +519,11 @@ class PPOTrainer(ABC):
         with marked_timer("adv", timing_raw, color="brown"):
             batch = self._compute_advantage(batch, metrics=metrics)
 
-        # 7b. [OPTIONAL] SDPO self-teacher forward: emit teacher top-k over reprompted sequences.
+        # 7b. [OPTIONAL] SDPO: build the reprompted teacher sequence. The teacher forward itself is
+        # co-located inside the update micro-batch (exact full-vocab KL), not a separate stage.
         if self.sdpo_enabled:
             with marked_timer("sdpo_teacher", timing_raw, color="green"):
-                batch = self._compute_self_teacher_topk(batch, metrics=metrics)
+                batch = self._build_self_teacher_sequence(batch, metrics=metrics)
 
         # 8. [OPTIONAL] update critic
         if self.use_critic:
@@ -1520,21 +1521,21 @@ class PPOTrainer(ABC):
 
         return batch
 
-    def _compute_self_teacher_topk(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
-        """SDPO: score the same responses under a feedback-augmented prompt and emit teacher top-k.
+    def _build_self_teacher_sequence(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """SDPO: build the feedback-augmented teacher sequence for the co-located teacher forward.
 
         Runs after reward/advantage and before _update_actor. Builds the reprompted teacher
-        sequence ``[teacher_prompt | response]`` per sample, runs an in-trainer no-grad forward
-        of the same actor weights, and writes the model's own top-k (``teacher_logprobs`` /
-        ``teacher_ids``) plus the per-sample ``self_distillation_mask`` back to TransferQueue, so
-        the SDPO top-k loss consumes them on the student update forward. The worker method
-        ``compute_self_teacher_topk`` renames the teacher_* fields to input_ids/etc.
+        sequence ``[teacher_prompt | response]`` per sample, nests it (so it micro-batches exactly
+        like the student's own input_ids), and writes ``teacher_input_ids`` plus the per-sample
+        ``self_distillation_mask`` back to TransferQueue. The exact full-vocab KL then runs the
+        teacher forward *inside* the student update micro-batch -- see
+        ``MegatronEngineWithLMHead._sdpo_teacher_full_log_probs`` -- so the teacher distribution is
+        never scored in a separate stage, never transported, and never CPU-copied.
         """
         from verl.trainer.ppo.sdpo_reprompt import build_teacher_messages
-        from verl.utils.model import compute_position_id_with_mask
 
         cfg = self.sdpo_config
-        assert cfg is not None, "_compute_self_teacher_topk requires sdpo.enabled"
+        assert cfg is not None, "_build_self_teacher_sequence requires sdpo.enabled"
 
         # 1. read the fields needed to build the reprompt. Per-rollout feedback text may live as
         # a top-level `feedback` field or nested in `extra_fields[i]["reward_extra_info"]`,
@@ -1605,74 +1606,30 @@ class PPOTrainer(ABC):
         teacher_prompt_mask = teacher_prompt["attention_mask"].to(device)
         teacher_input_ids = torch.cat([teacher_prompt_ids, responses], dim=1)
         teacher_attention_mask = torch.cat([teacher_prompt_mask, response_mask], dim=1)
-        teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
         self_distillation_mask = torch.tensor(sd_mask_list, dtype=torch.float32, device=device)
 
-        # 4. write the teacher sequence + mask back to TransferQueue for the worker forward.
+        # 4. Nest the teacher sequence directly from its attention mask -- the valid tokens per
+        # sample, in order (left-padding makes the valid region a contiguous right-hand block) -- so
+        # teacher_input_ids micro-batches exactly like the student's own nested input_ids. Done by
+        # masking rather than left_right_2_no_padding to keep unpad_input/flash_attn out of the
+        # trainer process; position_ids are derived from the offsets inside the engine forward, so
+        # they need not be transported. Rebind `batch` to the kv_batch_put result so _update_actor's
+        # dispatch fetches teacher_input_ids / self_distillation_mask (the incoming batch.fields
+        # schema does not include them); mirrors _compute_old_log_prob. The co-located teacher
+        # forward inside the update micro-batch consumes teacher_input_ids
+        # (MegatronEngineWithLMHead._sdpo_teacher_full_log_probs) -- no separate worker forward.
+        teacher_mask_bool = teacher_attention_mask.bool()
+        teacher_input_ids_nested = torch.nested.as_nested_tensor(
+            [teacher_input_ids[i][teacher_mask_bool[i]] for i in range(bsz)],
+            layout=torch.jagged,
+        )
         write_back = tu.get_tensordict(
             {
-                "teacher_input_ids": teacher_input_ids,
-                "teacher_attention_mask": teacher_attention_mask,
-                "teacher_position_ids": teacher_position_ids,
+                "teacher_input_ids": teacher_input_ids_nested,
                 "self_distillation_mask": self_distillation_mask,
             }
         )
-        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=write_back)
-
-        # 5. run the self-teacher forward (same weights, no grad, no loss). Use a fresh meta with
-        # fields=None so ALL current TQ fields resolve on the worker (including the teacher_* just
-        # written); the incoming `batch.fields` is a fixed schema that excludes them. The worker
-        # renames teacher_* -> the standard input fields and returns the model's own top-k.
-        teacher_batch = KVBatchMeta(
-            keys=batch.keys,
-            partition_id=batch.partition_id,
-            tags=getattr(batch, "tags", None),
-        )
-        teacher_batch.extra_info = {
-            "calculate_entropy": False,
-            "compute_loss": False,
-            "compute_self_teacher_topk": True,
-            "self_teacher_topk_k": cfg.distillation_loss.topk,
-            "no_lora_adapter": cfg.teacher_use_base_model,
-            "temperature": self.config.actor_rollout_ref.rollout.temperature,
-        }
-        output = self.actor_rollout_wg.compute_self_teacher_topk(teacher_batch)
-        assert len(output) == len(batch)
-
-        # 6. read back the teacher top-k (auto-collected over the TEACHER sequence) and re-map it
-        # onto the STUDENT's valid sequence [prompt | response]. The result stays NESTED: the
-        # megatron top-k kernel pads it to the same mini-batch max the student logits use, which a
-        # fixed prompt_width+response_width tensor would overshoot.
-        result = tq.kv_batch_get(
-            keys=batch.keys,
-            partition_id=batch.partition_id,
-            select_fields=["teacher_logprobs", "teacher_ids", "response_mask", "prompts"],
-        )
-        tl, ti, rm, prompts_nested = (
-            result["teacher_logprobs"],
-            result["teacher_ids"],
-            result["response_mask"],
-            result["prompts"],
-        )
-        # response-align (index j = the teacher distribution that predicts response token j).
-        resp_lp = response_from_nested(tl, rm) if tl.is_nested else tl
-        resp_ids = response_from_nested(ti, rm) if ti.is_nested else ti
-        resp_lp = resp_lp.to_padded_tensor(0.0) if resp_lp.is_nested else resp_lp
-        resp_ids = resp_ids.to_padded_tensor(0) if resp_ids.is_nested else resp_ids
-        prompt_lens = prompts_nested.offsets().diff()
-        response_lens = rm.offsets().diff() if rm.is_nested else rm.sum(dim=-1)
-        write = tu.get_tensordict(
-            {
-                "teacher_logprobs": response_to_sequence_nested(resp_lp, prompt_lens, response_lens),
-                "teacher_ids": response_to_sequence_nested(
-                    resp_ids, prompt_lens, response_lens, fill_value=self.tokenizer.pad_token_id
-                ),
-            }
-        )
-        # Rebind `batch` to the put result: kv_batch_put returns a meta whose `.fields` lists ALL
-        # persisted fields, so this is what makes _update_actor's dispatch fetch teacher_* (the
-        # incoming batch.fields schema does not include them). Mirrors _compute_old_log_prob.
-        batch = tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=write)
+        batch = tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=write_back)
 
         return batch
 
@@ -1789,8 +1746,8 @@ class PPOTrainer(ABC):
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
             self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         )
-        # Both served-teacher distillation and SDPO drive the same top-k engine hook; pick
-        # whichever loss config is active (they are mutually exclusive, checked in _setup).
+        # OPD served-teacher distillation (top-k) and SDPO (exact full-vocab KL) drive different
+        # engine hooks; pick whichever loss config is active (mutually exclusive, checked in _setup).
         if is_distillation_enabled(self.config.get("distillation")):
             active_distill_loss_cfg = self.distillation_config.distillation_loss
         elif self.sdpo_enabled:
@@ -1800,16 +1757,29 @@ class PPOTrainer(ABC):
         distillation_use_topk = (
             active_distill_loss_cfg.loss_settings.use_topk if active_distill_loss_cfg is not None else False
         )
+        # SDPO full-vocab KL: the co-located self-teacher forward runs inside the update micro-batch.
+        distillation_use_full_kl = (
+            active_distill_loss_cfg.loss_settings.use_full_kl if active_distill_loss_cfg is not None else False
+        )
         distillation_only = False  # distillation_only flag means we can skip policy loss and reduce mem footprint
         if active_distill_loss_cfg is not None:
             distillation_only = (
-                distillation_use_topk
+                (distillation_use_topk or distillation_use_full_kl)
                 and not active_distill_loss_cfg.use_task_rewards
                 and not active_distill_loss_cfg.use_policy_gradient
             )
+            # SDPO is_clip reweights the distill loss by exp(logp - old_logp), which needs the
+            # student's per-token log_probs. distillation_only skips computing them, so it is
+            # incompatible with is_clip -- force log_probs on when is_clip is set. The policy-loss
+            # branch stays inert (use_task_rewards/use_policy_gradient are both false, so the loss
+            # composition still yields pure distillation); only the extra log_prob forward is added.
+            if distillation_only and self.sdpo_enabled and getattr(self.sdpo_config, "is_clip", None) is not None:
+                distillation_only = False
         extra_info = {
             "calculate_entropy": calculate_entropy,
             "distillation_use_topk": distillation_use_topk,
+            "distillation_use_full_kl": distillation_use_full_kl,
+            "sdpo_teacher_use_base_model": (self.sdpo_config.teacher_use_base_model if self.sdpo_enabled else False),
             "distillation_only": distillation_only,
             "global_batch_size": ppo_mini_batch_size,
             "mini_batch_size": ppo_mini_batch_size,

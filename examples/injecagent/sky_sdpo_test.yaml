@@ -2,23 +2,23 @@
 #
 # Full run (provisions, installs, runs every stage):
 #   sky launch -c clap-sdpo-test examples/injecagent/sky_sdpo_test.yaml \
-#     --secret OPENAI_API_KEY --secret WANDB_API_KEY --secret HF_TOKEN
+#     --secret WANDB_API_KEY --secret HF_TOKEN
 #
 # Re-run selected stages on an existing cluster (re-syncs the workdir, skips `setup`):
-#   sky exec clap-sdpo-test examples/injecagent/sky_sdpo_test.yaml --env SDPO_STAGES=D \
-#     --secret OPENAI_API_KEY --secret WANDB_API_KEY --secret HF_TOKEN
+#   sky exec clap-sdpo-test examples/injecagent/sky_sdpo_test.yaml --env SDPO_STAGES=G \
+#     --secret WANDB_API_KEY --secret HF_TOKEN
 #
-# Stages: (A) SDPO unit tests, (B) real 2-GPU vocab-parallel top-k, (C) config compose +
-# loss-selection, (D) 1-step SDPO training smoke on the real CLAP task, (E) the free
-# exclamation-marks-only task end to end, (F) a three-run convex task/SDPO loss sweep. A-C abort
-# on failure; D-F are captured even on failure so the error is available for iteration.
-# SDPO_STAGES selects which run.
+# Stages: (A) SDPO unit tests, (B) real 2-GPU vocab-parallel top-k + reverse-KL kernel,
+# (C) config compose + loss-selection, (G) the pure-SDPO exclamation-marks run -- reference-matched
+# and env-parameterized. A-C abort on failure; G is captured even on failure so the error is
+# available for iteration. SDPO_STAGES selects which run. No remaining stage calls the hosted
+# defender, so none needs OPENAI_API_KEY -- G's reward is a local string predicate (exclaim.py)
+# that costs nothing per step.
 #
-# E is NOT in the default set only because it is a 20-step run, not because it is expensive: its
-# reward is a local string predicate, so it needs no OPENAI_API_KEY and costs nothing per step.
-# It is the stage that answers "does SDPO actually move the policy?" -- run it after any change
-# to the objective, the reprompt path or the top-k transport:
-#   sky exec clap-sdpo-test examples/injecagent/sky_sdpo_test.yaml --env SDPO_STAGES=E \
+# G is NOT in the default set because it is a multi-step training run, not because it is expensive.
+# It is the stage that answers "does SDPO actually move the policy?" -- run it after any change to
+# the objective, the reprompt path or the top-k transport:
+#   sky exec clap-sdpo-test examples/injecagent/sky_sdpo_test.yaml --env SDPO_STAGES=G \
 #     --secret WANDB_API_KEY --secret HF_TOKEN
 
 resources:
@@ -30,10 +30,9 @@ num_nodes: 1
 workdir: .
 
 envs:
-  SDPO_STAGES: ABCD
+  SDPO_STAGES: ABC
 
 secrets:
-  OPENAI_API_KEY: ""
   WANDB_API_KEY: ""
   HF_TOKEN: ""
 
@@ -85,6 +84,43 @@ setup: |
   python examples/injecagent/patch_megatron_bridge.py
 
   python -c "import megatron.core, transformer_engine.pytorch, transformers, vllm; print('vllm', vllm.__version__, '| transformers', transformers.__version__, '| Megatron and TE ok')"
+
+  # Blackwell-only: give TransformerEngine a FlashAttention backend. TE 2.17 ships NO fused/flash
+  # attention path for sm_120 (RTX PRO 6000 / RTX 5090), so THD-packed + sliding-window attention
+  # falls back to the unfused DPA path and dies in get_full_mask (RuntimeError: size of tensor a
+  # (packed seqlen) must match b (micro-batch) at dim 2) -- this crashes BOTH the student and the
+  # co-located SDPO teacher forward. Dao flash-attn 2.8.3 is exactly TE 2.17's MAX supported FA2
+  # version; the cu13/torch2.11/cp312 wheel (fetched on the node, not synced) handles varlen
+  # (cu_seqlens) + sliding window, so TE picks it and never calls get_full_mask. Hopper (H100, sm_90)
+  # already has TE's built-in fused attention and needs none of this, so gate on the GPU arch:
+  # Blackwell == compute-capability major >= 10 (H100=9.0, Ada=8.9, Ampere=8.0 all skip).
+  CC="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ' || true)"
+  CC_MAJOR="${CC%%.*}"
+  echo "GPU compute capability: '${CC:-unknown}' (major '${CC_MAJOR:-?}')"
+  if [ "${CC_MAJOR:-0}" -ge 10 ] 2>/dev/null; then
+    echo "Blackwell GPU detected -> installing Dao flash-attn 2.8.3 (TE FlashAttention backend)"
+    uv pip install \
+      "https://github.com/adithyaxx/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu13torch2.11cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+    python -c "import flash_attn; print('flash_attn', flash_attn.__version__, 'ready for TE')"
+
+    # fla 0.5.1 (latest release) autotunes the gated-delta-rule BACKWARD with configs that emit a
+    # CUDA "misaligned address" on sm_120 (tighter ~99KB shared mem + SM80-era MMA than the sm_80/90
+    # the configs assume) -- it faults in prepare_wy_repr_bwd_kernel during Triton do_bench. fla main
+    # commit ac6c648 "Restrict Blackwell gated delta bwd autotune" (2026-07-02, POST-0.5.1) prunes
+    # those configs, so upgrade fla to main on Blackwell only (H100 keeps the validated 0.5.1). Pure
+    # Python (Triton kernels JIT at runtime) so no build; --no-deps so the git version can't pull a
+    # transformers/torch that breaks megatron-bridge (deps already satisfied by the base install).
+    uv pip install --upgrade --no-deps \
+      "flash-linear-attention @ git+https://github.com/fla-org/flash-linear-attention.git@main"
+    python -c "import fla; print('fla', getattr(fla, '__version__', '?'), 'from main (Blackwell GDN bwd autotune fix)')"
+  else
+    echo "Non-Blackwell GPU (cc '${CC:-unknown}') -> skipping flash-attn wheel + fla-main (TE fused attention + fla 0.5.1 already work)"
+  fi
+
+  # Default training model for Stage G: the instruct model follows the in-context exclaim
+  # feedback, which the base model does not.
+  hf download Qwen/Qwen3.5-4B --local-dir "$HOME/models/Qwen3.5-4B"
+  # Base model kept as the negative-control override (Stage G with SDPO_MODEL_NAME=Qwen3.5-4B-Base).
   hf download Qwen/Qwen3.5-4B-Base --local-dir "$HOME/models/Qwen3.5-4B-Base"
   python examples/data_preprocess/injecagent.py --output-dir "$HOME/data/injecagent"
 
@@ -100,6 +136,9 @@ run: |
   export OMP_NUM_THREADS=16
   export VLLM_USE_DEEP_GEMM=0
   export RAY_memory_usage_threshold=0.98
+  # NOTE: do NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here -- it is incompatible
+  # with vLLM's cumem (cuMemCreate/Map) sleep/wake allocator used for colocated offload and makes
+  # the rollout workers OOM at init. Control SDPO update memory via ppo_micro_batch_size instead.
   unset RAY_ADDRESS || true
 
   cd ~/sky_workdir
@@ -116,9 +155,9 @@ run: |
   fi
 
   if [[ "$SDPO_STAGES" == *B* ]]; then
-    echo "=================== STAGE B: real 2-GPU vocab-parallel top-k ==================="
+    echo "=================== STAGE B: real 2-GPU vocab-parallel full-vocab KL kernel ==================="
     torchrun --standalone --nproc_per_node=2 \
-      tests/special_standalone/test_sdpo_vocab_topk_dist.py || { echo "STAGE B FAILED"; exit 1; }
+      tests/special_standalone/test_sdpo_full_kl_dist.py || { echo "STAGE B FAILED (full-kl)"; exit 1; }
     echo "STAGE B PASSED"
   fi
 
@@ -134,100 +173,83 @@ run: |
       cfg = compose(config_name="ppo_trainer", overrides=[
           "sdpo.enabled=true", "sdpo.distillation_loss.use_task_rewards=false"])
   sd = omega_conf_to_dataclass(cfg.sdpo)
-  assert sd.enabled and sd.alpha == 0.0 and sd.distillation_loss.loss_settings.use_topk
-  assert get_distillation_loss_fn("self_distill_jsd_topk").__name__ == "compute_self_distill_jsd_topk"
+  assert sd.enabled and sd.alpha == 0.0 and sd.distillation_loss.loss_settings.use_full_kl
+  assert get_distillation_loss_fn("self_distill_full_kl").__name__ == "compute_self_distill_full_kl_metric"
   print("STAGE C PASSED: SelfDistillationConfig + loss registry OK")
   PY
   fi
 
-  if [[ "$SDPO_STAGES" == *D* ]]; then
-    echo "=================== STAGE D: 1-step SDPO training smoke (captured) ==================="
-    MODEL_PATH="$HOME/models/Qwen3.5-4B-Base" \
-      examples/injecagent/run_qwen3_5_4b_megatron_sdpo.sh \
-        trainer.val_before_train=False \
-        trainer.test_freq=-1 \
-        trainer.save_freq=-1 \
-        trainer.total_training_steps=1 \
-        2>&1 | tee "$HOME/injecagent_sdpo_smoke.log"
-    SMOKE_RC=${PIPESTATUS[0]}
-    echo "STAGE D exit code: $SMOKE_RC"
-    echo "--- tail of smoke log ---"; tail -n 60 "$HOME/injecagent_sdpo_smoke.log" || true
-    [[ "$SDPO_STAGES" == *E* ]] || exit $SMOKE_RC
-  fi
-
-  if [[ "$SDPO_STAGES" == *E* ]]; then
-    echo "=================== STAGE E: exclamation sentence endings, 20 steps (captured) ==================="
-    MODEL_PATH="$HOME/models/Qwen3.5-4B-Base" \
+  if [[ "$SDPO_STAGES" == *G* ]]; then
+    # PURE-SDPO reference-matched hyperparameter run. The exclaim SDPO launcher already sets
+    # use_task_rewards=false / use_policy_gradient=false, so the loss is driven ENTIRELY by the
+    # self-teacher divergence -- this stage exists to find hyperparameters that make that pure
+    # objective converge instead of collapse, mirroring the reference SDPO repo's stable config
+    # (/scr1/michael/SDPO: lr=1e-5, lr_warmup_steps=10, success_reward_threshold=0.5). The
+    # reference's EMA teacher and the interpolating trust-region blend (lerp(ref, student, c))
+    # are NOT reachable here (stubbed NotImplementedError in this port). The mix_coef->0 limit of
+    # the trust-region teacher IS reachable, though: sdpo.teacher_use_base_model runs the teacher
+    # forward with the LoRA adapter disabled, so the teacher is the frozen base = the reference
+    # (the base weights never train). SDPO_BASE_TEACHER=true toggles it -- a frozen-reference-
+    # anchored teacher in place of the default live self-teacher (base+adapter given feedback).
+    # is_clip=2.0 stays out of reach either way. So this stage isolates whether lr + warmup + threshold
+    # (+ optionally a frozen-reference teacher) are enough. Parameterized by env vars so each run
+    # is a one-line `sky exec --env`.
+    : "${SDPO_LR:=1e-5}"
+    : "${SDPO_WARMUP:=10}"
+    : "${SDPO_THRESHOLD:=0.5}"
+    : "${SDPO_STEPS:=40}"
+    : "${SDPO_ALPHA:=0.0}"     # 0 = forward KL (mass-covering), 1 = reverse KL (mode-seeking)
+    : "${SDPO_ISCLIP:=null}"   # per-token IS-ratio cap, e.g. 2.0; null disables
+    : "${SDPO_BASE_TEACHER:=false}"   # true = frozen base (LoRA disabled) as teacher = the reference (mix_coef->0 trust-region)
+    : "${SDPO_TAG:=ref}"
+    # Model / reasoning / context. Default is the 4B instruct model at 1024 ctx with reasoning off
+    # -- the launcher documents this as the correct exclaim config, since the exclaim reward scores
+    # only the post-</think> answer and thinking would just flood it with period-ended sentences.
+    # A base model follows the in-context exclaim feedback too weakly to teach it by distillation,
+    # so SDPO_MODEL_NAME=Qwen3.5-4B-Base is the negative-control override. The teacher-signal
+    # reasoning variant additionally sets SDPO_THINKING=True and larger SDPO_RESP_LEN/SDPO_MODEL_LEN.
+    # Select by model dir name (under $HOME/models, downloaded in setup); $HOME expands in-box.
+    : "${SDPO_MODEL_NAME:=Qwen3.5-4B}"
+    SDPO_MODEL="$HOME/models/$SDPO_MODEL_NAME"
+    : "${SDPO_THINKING:=False}"
+    : "${SDPO_RESP_LEN:=1024}"
+    : "${SDPO_PROMPT_LEN:=1024}"
+    : "${SDPO_MODEL_LEN:=1024}"          # must be >= prompt + response
+    : "${SDPO_REPROMPT_LEN:=2048}"
+    : "${SDPO_MAXSEQS:=128}"
+    : "${SDPO_MAXTOK:=32768}"
+    : "${SDPO_CUDAGRAPH:=[1,2,4,8,16,32,64,128]}"   # every size must be <= SDPO_MAXSEQS
+    echo "=================== STAGE G: pure-SDPO (model=$SDPO_MODEL thinking=$SDPO_THINKING resp=$SDPO_RESP_LEN lr=$SDPO_LR alpha=$SDPO_ALPHA is_clip=$SDPO_ISCLIP base_teacher=$SDPO_BASE_TEACHER steps=$SDPO_STEPS tag=$SDPO_TAG) ==================="
+    MODEL_PATH="$SDPO_MODEL" \
       examples/injecagent/run_qwen3_5_4b_megatron_sdpo_exclaim.sh \
-        2>&1 | tee "$HOME/exclaim_sdpo.log"
-    EXCLAIM_RC=${PIPESTATUS[0]}
-    echo "STAGE E exit code: $EXCLAIM_RC"
-    # The verdict is the trend, not the exit code: exclaim_fraction should climb toward 1.0 while
-    # sdpo/reprompt_sample_fraction falls from ~1.0 as rollouts start passing. A clean exit with
-    # a flat exclaim_fraction is a FAILURE -- the objective did not move the policy.
-    echo "--- exclaim / sdpo metrics across steps ---"
-    grep -oE "(critic/rewards|exclaim_fraction|sentence_endings|sdpo)/[a-z_]*:[0-9.]*" "$HOME/exclaim_sdpo.log" || true
-    echo "--- tail of exclaim log ---"; tail -n 60 "$HOME/exclaim_sdpo.log" || true
-    exit $EXCLAIM_RC
-  fi
-
-  if [[ "$SDPO_STAGES" == *F* ]]; then
-    echo "=================== STAGE F: convex task/SDPO loss interpolation sweep ==================="
-    # Answers "does blending GRPO with SDPO converge faster than either alone, and at what mix?"
-    # on the free exclamation task. Each run is Stage E with `use_task_rewards=true`, so the loss
-    # is `(1 - alpha) * GRPO pg_loss + alpha * SDPO divergence` (verl/trainer/distillation/losses.py).
-    #
-    # Besides the two coefficients, the overrides below are throughput-only and do NOT change the
-    # optimization: micro-batch sizes are gradient-accumulation knobs (the optimization batch is
-    # ppo_mini_batch_size=16, untouched), and max_num_seqs / max_num_batched_tokens /
-    # cudagraph_capture_sizes are vLLM serving knobs that never enter the training math. So the
-    # curves stay comparable to each other and to Stage E.
-    #
-    # max_num_seqs in particular is not a micro-optimization here: rollout.n=8 * train_batch_size=16
-    # means 128 sequences are generated per step, so the Stage E value of 64 forces every step
-    # through vLLM in two waves. 128 makes it one.
-    #
-    # gpu_memory_utilization deliberately stays at Stage E's 0.8 rather than rising to 0.85. This
-    # is the one knob that trades *away* training memory, and the blend needs more of it than
-    # Stage E did: use_task_rewards=true makes distillation_only False (trainer_base.py), so the
-    # policy-loss path that pure SDPO skipped now runs alongside the SDPO teacher forward.
-    # Likewise recompute stays at full/uniform/every-layer -- the slowest, highest-headroom
-    # setting -- because an unattended five-run sweep is the wrong place to discover an OOM.
-    # The alpha=0.0 and alpha=1.0 endpoints are run as *controlled* ablations: sdpo.enabled and
-    # use_task_rewards stay true for all five, so the reprompt and teacher-forward paths execute
-    # identically and the only thing that changes between runs is the pair of coefficients. That
-    # costs a wasted teacher forward at alpha=0, and is worth it -- flipping sdpo.enabled=false
-    # instead would change the code path, the batch contents and the step time all at once, so a
-    # difference in the curve could no longer be attributed to the objective.
-    #
-    # Ordered so the three requested blends finish first: if the box dies or the sweep is cut
-    # short, the interpolation question is already answered and only the anchors are missing.
-    SWEEP_RC=0
-    # Each spec is "tag sdpo_coef task_coef"; specs are ';'-separated. Override SWEEP_SPECS to run
-    # a subset -- e.g. SWEEP_SPECS="000 0.0 1.0" for a single pure-GRPO control -- without editing
-    # this file, so a diagnostic run stays byte-identical to a sweep run save for the coefficients.
-    DEFAULT_SPECS="050 0.5 0.5;075 0.75 0.25;025 0.25 0.75;000 0.0 1.0;100 1.0 0.0"
-    IFS=';' read -ra SPECS <<< "${SWEEP_SPECS:-$DEFAULT_SPECS}"
-    for SPEC in "${SPECS[@]}"; do
-      read -r TAG SDPO_COEF TASK_COEF <<< "$SPEC"
-      echo "--- alpha=$SDPO_COEF: ${TASK_COEF} * task loss + ${SDPO_COEF} * SDPO loss ---"
-      MODEL_PATH="$HOME/models/Qwen3.5-4B-Base" \
-        examples/injecagent/run_qwen3_5_4b_megatron_sdpo_exclaim.sh \
-          sdpo.distillation_loss.use_task_rewards=true \
-          sdpo.distillation_loss.task_loss_coef="$TASK_COEF" \
-          sdpo.distillation_loss.distillation_loss_coef="$SDPO_COEF" \
-          actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
-          actor_rollout_ref.rollout.max_num_seqs=128 \
-          actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
-          actor_rollout_ref.rollout.cudagraph_capture_sizes='[1,2,4,8,16,32,64,128]' \
-          trainer.experiment_name="exclaim_sdpo_blend_a${TAG}" \
-          2>&1 | tee "$HOME/exclaim_sdpo_blend_a${TAG}.log"
-      RUN_RC=${PIPESTATUS[0]}
-      echo "alpha=$SDPO_COEF exit code: $RUN_RC"
-      (( RUN_RC == 0 )) || SWEEP_RC=$RUN_RC
-    done
-    echo "--- sweep convergence table ---"
-    python examples/injecagent/parse_exclaim_curves.py \
-      "$HOME"/exclaim_sdpo_blend_a*.log --csv-dir "$HOME/exclaim_curves" || true
-    exit $SWEEP_RC
+        actor_rollout_ref.actor.optim.lr="$SDPO_LR" \
+        actor_rollout_ref.actor.optim.lr_warmup_steps="$SDPO_WARMUP" \
+        sdpo.success_reward_threshold="$SDPO_THRESHOLD" \
+        sdpo.alpha="$SDPO_ALPHA" \
+        sdpo.is_clip="$SDPO_ISCLIP" \
+        sdpo.teacher_use_base_model="$SDPO_BASE_TEACHER" \
+        sdpo.max_reprompt_len="$SDPO_REPROMPT_LEN" \
+        sdpo.remove_thinking_from_demonstration=True \
+        data.max_prompt_length="$SDPO_PROMPT_LEN" \
+        data.max_response_length="$SDPO_RESP_LEN" \
+        ++data.apply_chat_template_kwargs.enable_thinking="$SDPO_THINKING" \
+        actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$SDPO_MODEL_LEN" \
+        actor_rollout_ref.rollout.max_model_len="$SDPO_MODEL_LEN" \
+        actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="$SDPO_MODEL_LEN" \
+        actor_rollout_ref.rollout.gpu_memory_utilization="${SDPO_GPUMEM:-0.6}" \
+        actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${SDPO_PPOMBS:-4}" \
+        actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${SDPO_LOGPROBMBS:-4}" \
+        actor_rollout_ref.actor.megatron.param_offload="${SDPO_OFFLOAD:-true}" \
+        actor_rollout_ref.actor.megatron.optimizer_offload="${SDPO_OFFLOAD:-true}" \
+        actor_rollout_ref.actor.megatron.grad_offload="${SDPO_OFFLOAD:-true}" \
+        actor_rollout_ref.rollout.max_num_seqs="$SDPO_MAXSEQS" \
+        actor_rollout_ref.rollout.max_num_batched_tokens="$SDPO_MAXTOK" \
+        actor_rollout_ref.rollout.cudagraph_capture_sizes="$SDPO_CUDAGRAPH" \
+        trainer.total_training_steps="$SDPO_STEPS" \
+        trainer.experiment_name="exclaim_sdpo_refhp_${SDPO_TAG}" \
+        2>&1 | tee "$HOME/exclaim_sdpo_refhp_${SDPO_TAG}.log"
+    RC=${PIPESTATUS[0]}
+    echo "STAGE G ($SDPO_TAG) exit code: $RC"
+    python examples/injecagent/parse_exclaim_curves.py "$HOME/exclaim_sdpo_refhp_${SDPO_TAG}.log" || true
+    exit $RC
   fi

@@ -664,33 +664,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @DistProfiler.annotate(color="green", role="actor_self_teacher_topk")
-    @_with_routing_replay_flag(enabled=True)
-    def compute_self_teacher_topk(self, data: TensorDict) -> TensorDict:
-        """SDPO self-teacher forward: emit the model's own top-k over a reprompted sequence.
-
-        The trainer arranges ``data`` so that the teacher (feedback-augmented prompt + the
-        SAME sampled response) occupies the standard ``input_ids`` / ``attention_mask`` /
-        ``position_ids`` fields, and sets non-tensor flags ``compute_self_teacher_topk=True``,
-        ``self_teacher_topk_k``, ``compute_loss=False`` (so no loss fn runs) and, for the
-        base-model teacher variant, ``no_lora_adapter=True``. The engine's self-top-k branch
-        (see megatron transformer_impl._lm_head_logits_processor) returns ``teacher_logprobs``
-        and ``teacher_ids``, which the SDPO loss consumes on the next student forward.
-        """
-        # Swap the teacher sequence into the standard input fields so the engine's
-        # left_right_2_no_padding forwards the feedback-augmented prompt (not the student's).
-        for teacher_key, std_key in (
-            ("teacher_input_ids", "input_ids"),
-            ("teacher_attention_mask", "attention_mask"),
-            ("teacher_position_ids", "position_ids"),
-        ):
-            assert teacher_key in data.keys(), f"{teacher_key} missing from SDPO teacher batch"
-            data[std_key] = data.pop(teacher_key)
-        output = self.actor.infer_batch(data)
-
-        return output.cpu() if output is not None else None
-
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:

@@ -41,8 +41,25 @@ from typing import Any
 
 __all__ = ["compose_feedback", "compute_score", "score_response"]
 
-_FEEDBACK = "please write your response such that all sentences end in exclamations."
+_FEEDBACK = "please write your final answer such that all sentences end in exclamations."
 _SENTENCE_ENDINGS = frozenset(".!?")
+
+
+def answer_after_reasoning(solution_str: str) -> str:
+    """Return the final answer, dropping any ``<think>...</think>`` reasoning span.
+
+    With reasoning enabled the response is ``<think>{reasoning}</think>{answer}``; the reasoning
+    is full of ordinary period-ending sentences that would swamp the exclamation signal (and never
+    let a rollout clear the demonstration threshold). Score only the post-``</think>`` answer.
+    An unclosed ``<think>`` (the model was still reasoning at the length limit) means no answer was
+    produced -> empty string -> score 0.0. A response with no reasoning markers is scored whole, so
+    this is a no-op when reasoning is disabled.
+    """
+    if "</think>" in solution_str:
+        return solution_str.split("</think>", 1)[1]
+    if "<think>" in solution_str:
+        return ""
+    return solution_str
 
 
 def score_response(solution_str: str) -> tuple[float, float]:
@@ -50,9 +67,11 @@ def score_response(solution_str: str) -> tuple[float, float]:
 
     Each ``.``, ``?``, or ``!`` is treated as a sentence-ending mark. The reward is the fraction
     of those marks that are ``!``. Counting marks directly makes mixed punctuation such as ``?!``
-    receive partial credit rather than silently treating the question mark as acceptable.
+    receive partial credit rather than silently treating the question mark as acceptable. Only the
+    final answer is scored (any ``<think>...</think>`` reasoning span is dropped first).
     """
-    endings = [char for char in solution_str if char in _SENTENCE_ENDINGS]
+    answer = answer_after_reasoning(solution_str)
+    endings = [char for char in answer if char in _SENTENCE_ENDINGS]
     if not endings:
         return 0.0, 0.0
     fraction = sum(char == "!" for char in endings) / len(endings)
@@ -80,10 +99,11 @@ def compute_score(
     InjecAgent prompts (``data_source='injecagent'``) as-is.
     """
     score, fraction = score_response(solution_str)
+    answer = answer_after_reasoning(solution_str)
     return {
         "score": score,
         "exclaim_fraction": fraction,
-        "sentence_endings": float(sum(char in _SENTENCE_ENDINGS for char in solution_str)),
+        "sentence_endings": float(sum(char in _SENTENCE_ENDINGS for char in answer)),
         # SDPO feedback rides through reward_extra_info into non_tensor_batch, where the trainer
         # picks it up to build the self-teacher's feedback-augmented prompt.
         "feedback": compose_feedback(solution_str, score),
