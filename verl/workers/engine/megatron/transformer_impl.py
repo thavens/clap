@@ -61,6 +61,7 @@ from verl.utils.megatron_utils import (
     offload_megatron_optimizer,
     patch_engine_mtp,
     register_megatron_training_hooks,
+    unshard_megatron_fsdp_param,
     unwrap_model,
 )
 from verl.utils.model import extract_multi_modal_inputs, load_mcore_dist_weights
@@ -263,6 +264,13 @@ class MegatronEngine(BaseEngine):
             self.provider = provider
             tf_config = None  # Will be set after model creation
         self.bridge = bridge
+
+        if self.engine_config.use_megatron_fsdp and not self.vanilla_bridge:
+            # Megatron-Bridge's LoRA adapter split/merge assumes full tensors; patch
+            # it to reconstruct Megatron-FSDP adapter DTensors before that logic.
+            from verl.utils.megatron_utils import maybe_patch_megatron_bridge_fsdp_adapter_export
+
+            maybe_patch_megatron_bridge_fsdp_adapter_export()
 
         if not self.bridge:
             self.weight_converter = get_mcore_weight_converter(self.model_config.hf_config, self.dtype)
@@ -817,10 +825,25 @@ class MegatronEngine(BaseEngine):
             peft_config = build_peft_config_for_vllm(self.model_config.lora)
         # when lora adapter only, we only load adapter weights when base sync is done, otherwise load all weights
         load_megatron_model_to_gpu(self.module, load_grad=False, load_frozen_params=not adapter_only)
+        if self.engine_config.use_megatron_fsdp:
+            # Under ZeRO-3 (data_parallel_sharding_strategy=optim_grads_params) the
+            # sharded model-weight buffer is not populated from the optimizer master
+            # at rest, so the local shards read as size-0 storage during export.
+            # start_param_sync copies master -> bf16 model-weight shards (what runs
+            # before every forward), making the shards materializable for the
+            # bridge's per-param all-gather. No-op for non-sharded params.
+            for chunk in self.module:
+                sync_params = getattr(chunk, "start_param_sync", None)
+                if sync_params is not None:
+                    sync_params(force_sync=True)
         if self.vanilla_bridge:
             per_tensor_param = self.bridge.export_weights(self.module)
         elif adapter_only:
-            per_tensor_param = self.bridge.export_adapter_weights(self.module)
+            # cpu=False keeps Megatron-FSDP adapter DTensors on GPU so the bridge's
+            # fused-adapter split runs its coalesced all-gather over NCCL. The default
+            # (cpu=True) moves them to CPU, where the collective falls back to gloo,
+            # which does not implement allgather_into_tensor_coalesced.
+            per_tensor_param = self.bridge.export_adapter_weights(self.module, cpu=False)
         else:
             per_tensor_param = (
                 self.bridge.export_hf_weights(self.module, merge_adapter_weights=False)
@@ -837,6 +860,15 @@ class MegatronEngine(BaseEngine):
             from verl.utils.modelopt import export_qat_weights
 
             per_tensor_param = export_qat_weights(per_tensor_param, self.module, self._qat_config.mode, self.bridge)
+
+        if self.engine_config.use_megatron_fsdp:
+            # The Megatron-FSDP adapter export (run with cpu=False so its coalesced
+            # all-gather goes over NCCL) yields the adapter weights as DTensors.
+            # Gather them to full tensors before the vLLM weight sync; no-op for the
+            # already-full (plain) base weights.
+            per_tensor_param = (
+                (name, unshard_megatron_fsdp_param(tensor)) for name, tensor in per_tensor_param
+            )
 
         return per_tensor_param, peft_config
 
