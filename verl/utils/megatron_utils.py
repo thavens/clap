@@ -392,6 +392,76 @@ def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
     return unwrapped_model
 
 
+def unshard_megatron_fsdp_param(tensor):
+    """Gather a Megatron-FSDP-sharded parameter into a full local tensor.
+
+    Under ``use_megatron_fsdp=true`` the bridge's LoRA adapter exporter yields the
+    gathered-but-still-DTensor adapter weights (its base-weight path already
+    materializes full tensors). vLLM's weight loader needs plain tensors, so any
+    DTensor that reaches the sync boundary must be reconstructed to its full form.
+
+    ``uneven_dtensor_to_full_tensor`` (the same helper the base-weight path uses)
+    handles Megatron-FSDP's uneven shards; fall back to ``full_tensor()`` only if it
+    is unavailable. No-op for plain tensors, so it is safe to map over every
+    exported tensor.
+    """
+    from torch.distributed.tensor import DTensor
+
+    if not isinstance(tensor, DTensor):
+        return tensor
+    try:
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+            uneven_dtensor_to_full_tensor,
+        )
+
+        return uneven_dtensor_to_full_tensor(tensor)
+    except ImportError:
+        return tensor.full_tensor()
+
+
+_MEGATRON_FSDP_ADAPTER_PATCH_APPLIED = False
+
+
+def maybe_patch_megatron_bridge_fsdp_adapter_export():
+    """Make Megatron-Bridge's LoRA adapter exporter operate on full tensors.
+
+    Under Megatron-FSDP the adapter parameters are DTensor shards. Megatron-Bridge's
+    fused-adapter split logic (``_split_qkv_linear_out_weight`` /
+    ``_split_fused_fc1_linear_out_weight``) applies ``torch.chunk`` /
+    ``torch.split`` directly to those DTensors, which misbehaves (returns the wrong
+    number of chunks / degenerate shapes). Both the merge and non-merge exporters
+    build their tasks via ``MegatronPeftBridge.build_adapter_conversion_tasks``, so
+    reconstructing each task's ``param_weight`` to a full tensor there (the single
+    common source) lets the split/merge run on plain tensors. Idempotent; no-op if
+    Megatron-Bridge is absent.
+    """
+    global _MEGATRON_FSDP_ADAPTER_PATCH_APPLIED
+    if _MEGATRON_FSDP_ADAPTER_PATCH_APPLIED:
+        return
+    try:
+        from megatron.bridge.models.conversion.peft_bridge import MegatronPeftBridge
+    except ImportError:
+        return
+
+    _orig_build = MegatronPeftBridge.build_adapter_conversion_tasks
+
+    def _build_with_fsdp_unshard(self, megatron_model):
+        tasks_by_base = _orig_build(self, megatron_model)
+        for tasks in tasks_by_base.values():
+            for task in tasks:
+                for sub in (getattr(task, "linear_in_task", None), getattr(task, "linear_out_task", None)):
+                    if sub is not None and getattr(sub, "param_weight", None) is not None:
+                        # WeightConversionTask is a frozen dataclass; bypass the
+                        # frozen guard to swap the sharded DTensor for its full form.
+                        object.__setattr__(
+                            sub, "param_weight", unshard_megatron_fsdp_param(sub.param_weight)
+                        )
+        return tasks_by_base
+
+    MegatronPeftBridge.build_adapter_conversion_tasks = _build_with_fsdp_unshard
+    _MEGATRON_FSDP_ADAPTER_PATCH_APPLIED = True
+
+
 def convert_config(hf_config: PretrainedConfig, megatron_config) -> TransformerConfig:
     """[Deprecated] convert config
 
